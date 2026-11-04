@@ -98,8 +98,13 @@ def precompute_rope(
         (cos, sin), each float32 of shape (max_seq_len, head_dim // 2), where
         entry [t, i] is cos/sin of (t * freq_i).
     """
-    raise NotImplementedError
-
+    pair_idx = torch.arange(head_dim // 2, dtype=torch.float32, device=device)
+    freqs = theta ** (-2 * pair_idx / head_dim)
+    position = torch.arange(max_seq_len, dtype=torch.float32, device=device)
+    angles = torch.outer(position, freqs)
+    angle_sin = angles.sin()
+    angle_cos = angles.cos()
+    return (angle_cos, angle_sin)
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Rotate query/key vectors by their position.
@@ -115,7 +120,15 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
     Returns a tensor with the same shape and dtype as x.
     """
-    raise NotImplementedError
+    x_dtype = x.dtype
+    h = x.shape[-1]//2
+    a = x[..., :h]
+    b = x[..., h:]
+    a, b = a.to(torch.float32), b.to(torch.float32)
+    a_rotate = a * cos - b * sin
+    b_rotate = a * sin + b * cos
+    x_rotate = torch.cat([a_rotate, b_rotate], dim=-1)
+    return x_rotate.to(x_dtype)
 
 
 # ---------------------------------------------------------------------------
