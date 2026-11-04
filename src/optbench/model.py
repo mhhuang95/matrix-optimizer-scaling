@@ -153,11 +153,39 @@ class Attention(nn.Module):
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
-        raise NotImplementedError
+        self.d_model = cfg.d_model
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.head_dim
+        self.n_kv_heads = cfg.n_kv_heads
+        self.wq = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, self.d_model, bias=False)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """x: (B, T, D) -> (B, T, D). cos/sin are the first T rows of the RoPE tables."""
-        raise NotImplementedError
+        B, T, D = x.shape
+
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2) # B, self.n_heads, T, self.head_dim
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2) # B, self.n_kv_heads, T, self.head_dim
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2) # B, self.n_kv_heads, T, self.head_dim
+
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        group = self.n_heads // self.n_kv_heads
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+
+        scores = q @ k.transpose(-2, -1) / self.head_dim**0.5
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
+        attn_score = torch.softmax(scores.masked_fill(mask, float("-inf")), dim=-1)
+        attn = attn_score @ v
+        attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
+
+        return self.wo(attn)
+
 
 
 # ---------------------------------------------------------------------------
