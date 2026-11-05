@@ -204,10 +204,17 @@ class SwiGLU(nn.Module):
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
-        raise NotImplementedError
+        self.d_model = cfg.d_model
+        self.d_ff = cfg.d_ff
+        self.w1 = nn.Linear(self.d_model, self.d_ff, bias=False)
+        self.w3 = nn.Linear(self.d_model, self.d_ff, bias=False)
+        self.w2 = nn.Linear(self.d_ff, self.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        gate = F.silu(self.w1(x))
+        up = self.w3(x)
+        down = self.w2(gate * up)
+        return down
 
 
 # ---------------------------------------------------------------------------
