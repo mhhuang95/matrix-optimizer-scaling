@@ -263,7 +263,25 @@ class Transformer(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        raise NotImplementedError
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
+        self.norm = RMSNorm(cfg.d_model, cfg.norm_eps)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        if cfg.tie_embeddings:
+            self.lm_head.weight = self.tok_emb.weight
+        cos, sin = precompute_rope(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        
+        self.apply(self._init_weights)
+
+        for param_name, param in self.blocks.named_parameters():
+            if "attn.wo" in param_name or "mlp.w2" in param_name:
+                nn.init.normal_(param, mean=0.0, std=cfg.init_std / (2 * cfg.n_layers) ** 0.5)
+        
+    def _init_weights(self, m: nn.Module) -> None:
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=self.cfg.init_std)
 
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None
@@ -277,7 +295,17 @@ class Transformer(nn.Module):
             logits: (B, T, V) — computed in float32 for a stable loss
             loss:   scalar mean cross-entropy, or None if targets is None
         """
-        raise NotImplementedError
+        B, T = idx.shape
+        x = self.tok_emb(idx)
+        for block in self.blocks:
+            x = block(x, self.cos[:T], self.sin[:T])
+        x = self.norm(x)
+        logits = self.lm_head(x).to(torch.float32)
+        if targets is None:
+            return logits, None
+        loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab_size), targets.reshape(-1))
+        return logits, loss
+
 
     def num_params(self, non_embedding: bool = True) -> int:
         """Number of unique parameters.
@@ -286,4 +314,8 @@ class Transformer(nn.Module):
         (the "N" used for Chinchilla token budgets in this project). Tied
         weights must not be double-counted when non_embedding=False.
         """
-        raise NotImplementedError
+        block_param = sum(p.numel() for p in self.blocks.parameters())
+        norm_param = sum(p.numel() for p in self.norm.parameters())
+        if non_embedding:
+            return block_param + norm_param
+        return sum(p.numel() for p in self.parameters())
