@@ -108,6 +108,19 @@ def test_every_target_appears_once_per_shard(shard_data):
     np.testing.assert_array_equal(ys, arrays[0][1 : 1 + tw.n_windows * T])
 
 
+@pytest.mark.parametrize("n_tokens,expected", [(32, 1), (33, 2), (17, 1), (16, 0)])
+def test_window_needs_seq_len_plus_one_tokens(tmp_path, n_tokens, expected):
+    # Boundary case: a window spans T + 1 tokens, so a shard of exactly k*T
+    # tokens holds only k - 1 full windows.
+    p = tmp_path / "edge.bin"
+    write_shard(p, np.arange(n_tokens), vocab_size=V)
+    tw = TokenWindows([p], T)
+    assert tw.n_windows == expected
+    for k in range(tw.n_windows):
+        x, y = tw.window(k)
+        assert x.shape == y.shape == (T,)
+
+
 @pytest.mark.parametrize("k", [-1, "end"])
 def test_window_index_out_of_range(shard_data, k):
     paths, _ = shard_data

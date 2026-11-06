@@ -44,14 +44,25 @@ class TokenWindows:
     """
 
     def __init__(self, paths: list[str | Path], seq_len: int) -> None:
-        raise NotImplementedError
+        self.paths = paths
+        self.seq_len = seq_len
+        self.shards = [read_shard(path) for path in self.paths]
+        self.ends = np.cumsum([(len(shard)-1) // self.seq_len for shard in self.shards])
+
 
     @property
     def n_windows(self) -> int:
-        raise NotImplementedError
+        return int(self.ends[-1])
 
     def window(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        raise NotImplementedError
+        if not 0 <= k < self.n_windows:
+            raise IndexError(k)
+        i = int(np.searchsorted(self.ends, k, side="right"))   # which shard owns k
+        before = 0 if i == 0 else self.ends[i - 1]
+        local = k - before
+        start = local * self.seq_len
+        w = np.asarray(self.shards[i][start: start + self.seq_len + 1], dtype=np.int64)
+        return w[:-1], w[1:]
 
 
 def step_window_indices(step: int, global_batch: int, n_windows: int, seed: int) -> np.ndarray:
@@ -67,7 +78,7 @@ def step_window_indices(step: int, global_batch: int, n_windows: int, seed: int)
     Each epoch's permutation must be computed once and reused (calling this
     for consecutive steps must not redo an O(n_windows) shuffle every time).
     """
-    raise NotImplementedError
+    
 
 
 def get_batch(
