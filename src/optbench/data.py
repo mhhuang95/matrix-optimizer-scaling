@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import functools
 
 from optbench.shards import read_shard  # noqa: F401  (you will need it)
 
@@ -78,8 +79,20 @@ def step_window_indices(step: int, global_batch: int, n_windows: int, seed: int)
     Each epoch's permutation must be computed once and reused (calling this
     for consecutive steps must not redo an O(n_windows) shuffle every time).
     """
-    
+    first = step * global_batch
+    epoch = first // n_windows
+    perm = _epoch_permutation(n_windows, seed, epoch)
+    offset = first % n_windows
+    room = n_windows - offset
+    if room >= global_batch:
+        return perm[offset:offset+global_batch]
+    else: 
+        perm_next = _epoch_permutation(n_windows, seed, epoch+1)
+        return np.concatenate([perm[offset:], perm_next[:global_batch - room]])
 
+@functools.lru_cache(maxsize=8)
+def _epoch_permutation(n_windows, seed, epoch):
+    return np.random.default_rng((seed, epoch)).permutation(n_windows)
 
 def get_batch(
     windows: TokenWindows,
