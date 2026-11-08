@@ -119,4 +119,33 @@ def get_batch(
     Raise ValueError if global_batch is not divisible by world_size * accum_steps,
     or if rank / micro_step are out of range.
     """
-    raise NotImplementedError
+    if global_batch % (world_size * accum_steps) != 0:
+        raise ValueError(f"global_batch {global_batch} must be divisible by world_size * accum_steps!") 
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank {rank} must be in [0, world_size)!")
+    if not 0 <= micro_step < accum_steps:
+        raise ValueError(f"micro_step {micro_step} must be in the range [0, accum_steps)!")
+    
+    per_rank = global_batch // world_size
+    micro = per_rank // accum_steps
+    idx = step_window_indices(step, global_batch, windows.n_windows, seed)
+    start = rank * per_rank + micro_step * micro
+    micro_idx = idx[start : start + micro]
+
+    x_list, y_list = [], []
+    for k in micro_idx:
+        x, y = windows.window(k)
+        x_list.append(x)
+        y_list.append(y)
+    x_batch = torch.from_numpy(np.stack(x_list))
+    y_batch = torch.from_numpy(np.stack(y_list))
+
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        x_batch = x_batch.pin_memory().to(dev, non_blocking=True)
+        y_batch = y_batch.pin_memory().to(dev, non_blocking=True)
+    else:
+        x_batch = x_batch.to(dev)
+        y_batch = y_batch.to(dev)
+
+    return x_batch, y_batch
