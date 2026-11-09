@@ -52,6 +52,7 @@ import torch
 import torch.nn as nn
 
 Kind = Literal["matrix", "embed", "scalar"]
+_ORDER: tuple[Kind, ...] = ("matrix", "embed", "scalar")
 
 
 @dataclass
@@ -76,7 +77,16 @@ class GroupConfig:
         * weight_decay >= 0
         * embed_patterns is non-empty and every entry is a non-empty string
         """
-        raise NotImplementedError
+        if not self.matrix_lr > 0:
+            raise ValueError(f"matrix_lr {self.matrix_lr} should be larger than 0!")
+        if not self.embed_lr > 0:
+            raise ValueError(f"embed_lr {self.embed_lr} should be larger than 0!")
+        if not self. scalar_lr > 0:
+            raise ValueError(f"scalar_lr {self.scalar_lr} should be larger than 0!")
+        if not self.weight_decay >=  0:
+            raise ValueError(f"weight_decay {self.weight_decay} should be larger than or equal to 0!")
+        if  not self.embed_patterns or any(not isinstance(p, str) or not p for p in self.embed_patterns) :
+            raise ValueError("embed_patterns must be non-empty and every entry must be a non-empty string")
 
 
 def classify(name: str, param: torch.Tensor, cfg: GroupConfig) -> Kind:
@@ -92,7 +102,12 @@ def classify(name: str, param: torch.Tensor, cfg: GroupConfig) -> Kind:
     embed pattern. (A hypothetical `lm_head.bias` is a vector; a matrix
     method and weight decay are both wrong for it regardless of where it sits.)
     """
-    raise NotImplementedError
+    if param.ndim <= 1:
+        return "scalar"
+    elif any(emb_pattern in name for emb_pattern in cfg.embed_patterns):
+        return "embed"
+    else:
+        return "matrix"
 
 
 def build_param_groups(model: nn.Module, cfg: GroupConfig) -> list[dict[str, Any]]:
@@ -111,7 +126,31 @@ def build_param_groups(model: nn.Module, cfg: GroupConfig) -> list[dict[str, Any
 
     Calls cfg.validate() first.
     """
-    raise NotImplementedError
+    cfg.validate()
+    buckets: dict[Kind, list[tuple[str, nn.Parameter]]] = {k: [] for k in _ORDER}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        buckets[classify(name, param, cfg)].append((name, param))
+    
+    base_lr = {"matrix": cfg.matrix_lr, "embed": cfg.embed_lr, "scalar": cfg.scalar_lr}
+    weight_decay = {"matrix": cfg.weight_decay, "embed": cfg.weight_decay, "scalar": 0.0}
+
+    groups: list[dict[str, Any]] = []
+    for kind in _ORDER:
+        items = buckets[kind]
+        if not items:
+            continue
+        groups.append(
+            {
+                "params": [param for _, param in items],
+                "names": [name for name, _ in items],
+                "base_lr": float(base_lr[kind]),
+                "weight_decay": float(weight_decay[kind]),
+                "kind": kind,
+            }
+        )
+    return groups
 
 
 def split_by_optimizer(
@@ -123,7 +162,9 @@ def split_by_optimizer(
     "scalar". Returns the same dict objects, not copies, so both optimizers
     and any logging see one source of truth. Either list may be empty.
     """
-    raise NotImplementedError
+    matrix_groups = [g for g in groups if g["kind"] == "matrix"]
+    adamw_groups = [g for g in groups if g["kind"] in ("embed", "scalar")]
+    return matrix_groups, adamw_groups
 
 
 def group_summary(groups: list[dict[str, Any]]) -> str:
@@ -136,4 +177,12 @@ def group_summary(groups: list[dict[str, Any]]) -> str:
     Format (one line per group, no trailing newline):
         matrix: 14 tensors, 12,288 params, base_lr 2.0e-02, wd 0.1
     """
-    raise NotImplementedError
+    lines = []
+    for g in groups:
+        n_tensors = len(g["params"])
+        n_params = sum(p.numel() for p in g["params"])
+        lines.append(
+            f"{g['kind']}: {n_tensors} tensors, {n_params:,} params, "
+            f"base_lr {g['base_lr']:.1e}, wd {g['weight_decay']:g}"
+        )
+    return "\n".join(lines)
