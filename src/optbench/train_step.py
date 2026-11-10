@@ -92,7 +92,7 @@ class TrainStepConfig:
         if self.amp_dtype is None:
             return nullcontext()
         else:
-            return torch.autocast(device_type=self.device_type, dtype=torch.float16)
+            return torch.autocast(device_type=self.device_type, dtype=self.amp_dtype)
         
 
 
@@ -127,11 +127,14 @@ def clip_global_norm(params: Iterable[nn.Parameter], max_norm: float) -> torch.T
 
     Returns a 0-dim tensor, not a float: the caller decides when to sync.
     """
-    total = torch.sqrt(torch.stack([(p.grad**2).sum() for p in params if p.grad is not None]).sum())
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return torch.zeros(())
+    total = torch.sqrt(torch.stack([(grad**2).sum() for grad in grads]).sum())
     if max_norm > 0 and total > max_norm:
         scale_factor = max_norm / (total + 1e-6)
-        for p in params:
-            p.grad.mul(scale_factor)
+        for grad in grads:
+            grad.mul_(scale_factor) 
     return total
 
 
@@ -169,5 +172,40 @@ def train_step(
     `model.no_sync()` so the gradient all-reduce fires once, on the last one.
     Out of scope here — the wrapper lands in the DDP module.
     """
+    cfg.validate()
+    if not len(micro_batches) == cfg.accum_steps:
+        raise ValueError(f"len(micro_batches) {len(micro_batches)} must be equal to accum_steps {cfg.accum_steps}.")
+    micro_batche_tokens = [ y.numel() for _, y in micro_batches]
+    if not all(t == micro_batche_tokens[0] for t in micro_batche_tokens): 
+        raise ValueError("every micro-batch has the same number of target tokens")
+    if (cfg.amp_dtype is torch.float16 and scaler is None) or (scaler is not None and cfg.amp_dtype is not torch.float16):
+        raise ValueError("a scaler is allowed only with fp16!")
+
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
     
+    total_loss = torch.zeros((), device=cfg.device_type)
+    for x, y in micro_batches:
+        with cfg.autocast():
+            logits, loss = model(x, y)
+        loss = loss / cfg.accum_steps
+        if scaler is not None:
+            loss = scaler.scale(loss)
+        loss.backward()
+        total_loss += loss.detach()
+    
+    if scaler is not None:
+        for optimizer in optimizers:
+            scaler.unscale_(optimizer)
+    gradnorm = clip_global_norm(all_params(optimizers), cfg.grad_clip)
+    for optimizer in optimizers:
+        if scaler is not None:
+            scaler.step(optimizer)
+        else:
+            optimizer.step()
+    if scaler is not None:    
+        scaler.update()
+
+    return StepStats(loss=total_loss.item(), grad_norm=gradnorm.item(), n_tokens=micro_batche_tokens[0] * cfg.accum_steps)
+
     
