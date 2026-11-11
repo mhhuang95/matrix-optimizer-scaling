@@ -81,7 +81,21 @@ def atomic_save(obj: Any, path: str | Path) -> None:
     If the save raises, remove the temporary file and re-raise. Any existing
     file at `path` must be left exactly as it was.
     """
-    raise NotImplementedError
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = dest.with_name(dest.name + ".tmp")
+
+    try:
+        with open(tmp, "wb") as f:
+            torch.save(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    
+    os.replace(tmp, dest)
 
 
 def optimizer_group_names(
