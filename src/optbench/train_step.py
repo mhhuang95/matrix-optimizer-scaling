@@ -184,15 +184,19 @@ def train_step(
     for optimizer in optimizers:
         optimizer.zero_grad(set_to_none=True)
     
-    total_loss = torch.zeros((), device=cfg.device_type)
+    total_loss = None
     for x, y in micro_batches:
         with cfg.autocast():
             logits, loss = model(x, y)
         loss = loss / cfg.accum_steps
         if scaler is not None:
-            loss = scaler.scale(loss)
-        loss.backward()
-        total_loss += loss.detach()
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        if total_loss is None:
+            total_loss = loss.detach()
+        else:
+            total_loss = total_loss + loss.detach()
     
     if scaler is not None:
         for optimizer in optimizers:
