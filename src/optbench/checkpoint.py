@@ -198,7 +198,23 @@ def load_checkpoint(
 
     Then load model, each optimizer, and the scaler if there is one.
     """
-    raise NotImplementedError
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    if ckpt["version"] != CHECKPOINT_VERSION:
+        raise ValueError(f"Ckpt loading: ckpt version {ckpt["version"]} != CHECKPOINT_VERSION {CHECKPOINT_VERSION}!")
+    if len(ckpt["optimizers"]) != len(optimizers):
+        raise ValueError(f"Ckpt loading: Number of optimizers in ckpt {len(ckpt["optimizers"])} not equal to Number of optimizers in model {len(optimizers)}!")
+    for i, (ckpt_gnames, opt_gnames) in enumerate(zip(ckpt["group_names"], optimizer_group_names(optimizers))):
+        if ckpt_gnames != opt_gnames:
+            raise ValueError(f"Ckpt loading: in optimizer {i}, there is a mismatch on the group names in optimizer {opt_gnames} from the ckpt {ckpt_gnames}!")
+    if (ckpt["scaler"] is not None and scaler is None) or (ckpt["scaler"] is None and scaler is not None):
+        raise ValueError(f"Ckpt loading: there is mismatch on the scaler from checkpoint!")
+    model.load_state_dict(ckpt["model"])
+    for opt, ckpt_opt in zip(optimizers, ckpt["optimizers"]):
+        opt.load_state_dict(ckpt_opt)
+    if ckpt["scaler"] is not None:
+        scaler.load_state_dict(ckpt["scaler"])
+
+    return {"step": int(ckpt["step"]), "extra": ckpt["extra"]}
 
 
 def latest_checkpoint(dirpath: str | Path) -> Path | None:
@@ -212,4 +228,3 @@ def latest_checkpoint(dirpath: str | Path) -> Path | None:
     rest.
     """
     _step_re = re.compile(r"^step_(\d+)\.pt$")
-    raise NotImplementedError
