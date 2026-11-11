@@ -228,3 +228,19 @@ def latest_checkpoint(dirpath: str | Path) -> Path | None:
     rest.
     """
     _step_re = re.compile(r"^step_(\d+)\.pt$")
+
+    folder = Path(dirpath)
+    if not folder.is_dir():
+        return None
+
+    best_step = -1
+    best_path = None
+    for ckpt_path in folder.iterdir():
+        m = _step_re.match(ckpt_path.name)
+        if not m: 
+            continue
+        step = int(m.group(1))
+        if step > best_step:
+            best_step = step
+            best_path = ckpt_path
+    return best_path
