@@ -111,7 +111,15 @@ def optimizer_group_names(
     `build_param_groups` must fail at save time, not at load time three days
     later. Name the optimizer index and the group index in the message.
     """
-    raise NotImplementedError
+    result = []
+    for i, optimizer in enumerate(optimizers):
+        names = []
+        for k, group in enumerate(optimizer.param_groups):
+            if "names" not in group:
+                raise ValueError(f"optimizer {i}, group {k} has no 'names' key; build the optimizer's groups with optbench.param_groups.build_param_groups")
+            names.append(list(group["names"]))
+        result.append(names)
+    return result
 
 
 def save_checkpoint(
