@@ -154,8 +154,19 @@ def save_checkpoint(
     config belongs in the run directory as the YAML you launched with; a
     checkpoint that carries its own config invites the two to disagree.
     """
-    raise NotImplementedError
-
+    if step < 0:
+        raise ValueError(f"Step {step} < 0 is not allowed in checkpoint saving!")
+    ckpt = {
+        "version": CHECKPOINT_VERSION,
+        "step": int(step),
+        "model": model.state_dict(),
+        "optimizers": [opt.state_dict() for opt in optimizers],
+        "group_names": optimizer_group_names(optimizers),
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "extra": dict(extra) if extra is not None else {},
+    }
+    atomic_save(ckpt, path)
+    
 
 def load_checkpoint(
     path: str | Path,
