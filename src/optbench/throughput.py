@@ -125,7 +125,9 @@ def mfu(
     wrong — a sparsity peak, a halved attention term, or tokens counted twice
     under DDP — and clamping would hide exactly the bug worth seeing.
     """
-    raise NotImplementedError
+    if n_gpus < 1 or peak_flops_per_gpu <= 0:
+        raise ValueError(f"n_gpus {n_gpus} must be larger or equal to 1 and peak_flops_per_gpu {peak_flops_per_gpu} must be positive!")
+    return tokens_per_sec * flops_per_tok / (n_gpus * peak_flops_per_gpu)
 
 
 def step_was_skipped(scale_before: float, scale_after: float) -> bool:
