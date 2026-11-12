@@ -230,7 +230,10 @@ class ThroughputMeter:
         zero width (a clock that has not moved — common on a fast machine with
         a coarse clock, and a division by zero if you do not check).
         """
-        raise NotImplementedError
+        if self._t_last is None or self._t_last - self._t_start <= 0:
+            return None
+        return self.all_token_total / (self._t_last - self._t_start)
+        
 
     @property
     def goodput_tokens_per_sec(self) -> float | None:
@@ -241,4 +244,6 @@ class ThroughputMeter:
         than a percent or so, that is an argument for bf16, not for a bigger
         scaler patience.
         """
-        raise NotImplementedError
+        if self._t_last is None or self._t_last - self._t_start <= 0:
+            return None
+        return self.non_skipped_token_total / (self._t_last - self._t_start)
