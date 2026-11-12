@@ -144,7 +144,7 @@ def step_was_skipped(scale_before: float, scale_after: float) -> bool:
     its steps has quietly shortened its own training, and the loss curve shows
     it as "this optimizer is slightly worse".
     """
-    raise NotImplementedError
+    return scale_after < scale_before
 
 
 class ThroughputMeter:
@@ -181,7 +181,16 @@ class ThroughputMeter:
         Default `time.perf_counter` — a monotonic clock, unlike `time.time()`,
         which can step backwards when ntp adjusts it mid-run.
         """
-        raise NotImplementedError
+        if warmup_steps < 0:
+            raise ValueError(f"warmup_steps {warmup_steps} must be nonnegative!")
+        self.warmup_steps = warmup_steps
+        self.clock = clock
+        self.steps = 0
+        self.skipped_steps = 0
+        self.all_token_total = 0
+        self.non_skipped_token_total = 0
+        self._t_start = self.clock() if self.warmup_steps == 0 else None
+        self._t_last = None
 
     def update(self, n_tokens: int, skipped: bool = False) -> None:
         """Record one completed optimizer step.
@@ -198,7 +207,20 @@ class ThroughputMeter:
 
         Raise ValueError if n_tokens < 0.
         """
-        raise NotImplementedError
+        if n_tokens < 0:
+            raise ValueError(f"n_tokens {n_tokens} must be nonnegative!")
+        now = self.clock()
+        if skipped:
+            self.skipped_steps += 1
+        self.steps += 1
+        if self.steps == self.warmup_steps:
+            self._t_start = now
+        elif self.steps > self.warmup_steps:
+            self._t_last = now
+            if not skipped:
+                self.non_skipped_token_total += n_tokens
+            self.all_token_total += n_tokens
+
 
     @property
     def tokens_per_sec(self) -> float | None:
