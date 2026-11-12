@@ -75,8 +75,9 @@ def matmul_params(cfg: ModelConfig) -> int:
     Note GQA shrinks this: with KV < H, wk and wv are smaller, so a GQA model
     does fewer FLOPs per token than the MHA model with the same d_model.
     """
-    raise NotImplementedError
-
+    attn = cfg.d_model * cfg.n_heads * cfg.head_dim * 2 + cfg.d_model * cfg.n_kv_heads * cfg.head_dim * 2
+    mlp = cfg.d_model * cfg.d_ff * 3
+    return cfg.n_layers * (attn + mlp) + cfg.d_model * cfg.vocab_size
 
 
 def flops_per_token(cfg: ModelConfig, seq_len: int) -> int:
