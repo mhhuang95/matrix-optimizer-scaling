@@ -100,7 +100,11 @@ def flops_per_token(cfg: ModelConfig, seq_len: int) -> int:
 
     Raise ValueError unless 1 <= seq_len <= cfg.max_seq_len.
     """
-    raise NotImplementedError
+    if not 1 <= seq_len <= cfg.max_seq_len:
+        raise ValueError(f"seq_len {seq_len} must be in the range [1, {cfg.max_seq_len}]!")
+    matmul_flops = 6 * matmul_params(cfg)
+    attn_flops = 12 * cfg.n_layers * cfg.n_heads * cfg.head_dim * seq_len
+    return matmul_flops + attn_flops
 
 
 def mfu(
