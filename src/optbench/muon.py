@@ -145,8 +145,27 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         weight_decay: float = 0.0,
     ) -> None:
-        raise NotImplementedError
+        if not lr > 0:
+            raise ValueError(f"Muon LR {lr} must be positive!")
+        if not 0 <= momentum < 1:
+            raise ValueError(f"Momentum {momentum} must be in the range [0, 1)!")
+        if not ns_steps >= 1:
+            raise ValueError(f"ns_steps {ns_steps} must be positive.")
+        if not weight_decay >= 0:
+            raise ValueError(f"weight decay {weight_decay} factor must be non negative!")
+        defaults = {
+            "lr": lr,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "ns_steps": ns_steps,
+            "weight_decay": weight_decay,
+        }
+        super().__init__(params, defaults)
+        for i, group in enumerate(self.param_groups):
+            for p in group["params"]:
+                if p.ndim != 2:
+                    raise ValueError(f"Muon only works for 2D params, but found group {i} has {p.ndim} param!")  
 
     @torch.no_grad()
     def step(self, closure=None):
-        raise NotImplementedError
+        raise NotImplementedError 
