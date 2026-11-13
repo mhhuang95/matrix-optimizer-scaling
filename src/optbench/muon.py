@@ -72,8 +72,22 @@ def newton_schulz(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.T
     The zero matrix comes back as zeros (eps prevents 0/0) — relevant
     because a freshly-zeroed momentum buffer can produce exactly that.
     """
-    raise NotImplementedError
-
+    if not G.ndim == 2:
+        raise ValueError(f"Muon only works for G.ndim {G.ndim} == 2!")
+    if not steps >= 1:
+        raise ValueError(f"GS Steps must be >= 1!")
+    X = G / (G.norm() + eps)
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.transpose(0, 1)
+    (a, b, c) = _NS_COEFFS
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.transpose(0, 1)
+    return X
 
 class Muon(torch.optim.Optimizer):
     """Muon optimizer for 2-D hidden-weight matrices.
