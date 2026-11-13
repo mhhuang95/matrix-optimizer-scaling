@@ -168,4 +168,37 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        raise NotImplementedError 
+        
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    eff = g.add(buf, alpha=momentum)
+                else:
+                    eff = buf
+                u = newton_schulz(eff, steps=ns_steps)
+                scale = max(1.0, p.size(0)/p.size(1)) **0.5
+                p.mul_(1 - lr * weight_decay)
+                p.add_(u, alpha=-lr*scale)
+        
+        return loss
+                
+
