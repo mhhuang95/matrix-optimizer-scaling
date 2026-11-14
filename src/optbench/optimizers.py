@@ -110,4 +110,21 @@ def build_optimizers(
     GroupConfig and leave through the schedule; a bare lr argument here would
     be a second source of truth that drifts from the first.
     """
-    raise NotImplementedError
+    opt_cfg.validate()
+    groups = build_param_groups(model, group_cfg)
+    for group in groups:
+        group["lr"] = group["base_lr"]
+    opt_list = []
+    if opt_cfg.arm == "adamw":
+        group_opt = torch.optim.AdamW(params=groups, betas=opt_cfg.adamw_betas, eps=opt_cfg.adamw_eps)
+        opt_list.append(group_opt)
+    elif opt_cfg.arm == "muon":
+        matrix_groups, adamw_groups = split_by_optimizer(groups)
+        if matrix_groups:
+            group_opt = Muon(params=matrix_groups, momentum=opt_cfg.muon_momentum, nesterov=opt_cfg.muon_nesterov, ns_steps=opt_cfg.muon_ns_steps)
+            opt_list.append(group_opt)
+        if adamw_groups:
+            group_opt = torch.optim.AdamW(params=adamw_groups, betas=opt_cfg.adamw_betas, eps=opt_cfg.adamw_eps)
+            opt_list.append(group_opt)
+    
+    return opt_list
