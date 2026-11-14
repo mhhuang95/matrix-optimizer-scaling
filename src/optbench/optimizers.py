@@ -76,7 +76,16 @@ class OptimizerConfig:
         * 0 <= muon_momentum < 1
         * muon_ns_steps >= 1
         """
-        raise NotImplementedError
+        if self.arm not in ["muon", "adamw"]:
+            raise ValueError(f"Arm {self.arm} must be in [muon, adamw]!")
+        if not 0 <= self.adamw_betas[0] < 1 or not 0 <= self.adamw_betas[1] < 1:
+            raise ValueError(f"both adamw_betas {self.adamw_betas} are in [0, 1)!")
+        if not self.adamw_eps > 0:
+            raise ValueError(f"adamw eps {self.adamw_eps} must be > 0!")
+        if not 0 <= self.muon_momentum < 1:
+            raise ValueError(f"muon momentum {self.muon_momentum} must be within [0, 1)!")
+        if not self.muon_ns_steps >= 1:
+            raise ValueError(f"muon ne steps {self.muon_ns_steps} must be >= 1!")
 
 
 def build_optimizers(
