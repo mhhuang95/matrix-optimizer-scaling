@@ -1,0 +1,1074 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+All rights reserved.
+
+This source code is licensed under the BSD-style license found in the
+LICENSE file in the root directory of this source tree.
+
+"""
+
+import math
+import re
+import unittest
+from operator import methodcaller
+from unittest.mock import MagicMock, patch
+
+import torch
+import torch._dynamo
+from distributed_shampoo.shampoo_types import (
+    DISTRIBUTED_CONFIG,
+    FSDPParamAssignmentStrategy,
+    FullyShardDistributedConfig,
+    HybridShardDistributedConfig,
+    LoadBalancingConfig,
+    OWNER_RANKS,
+    PARAMS,
+    SingleDeviceDistributedConfig,
+)
+from distributed_shampoo.utils.load_balancing_utils import (
+    PolynomialComputationalCostModel,
+)
+from distributed_shampoo.utils.shampoo_fully_shard_utils import (
+    _compute_chunk_sizes,
+    GatherGradientsContext,
+)
+from distributed_shampoo.utils.shampoo_utils import (
+    _device_key,
+    _get_symmetric_gather_indices,
+    _get_triu_flat_indices,
+    _index_dtype,
+    compress_list,
+    distribute_buffer_sizes,
+    generate_pairwise_indices,
+    get_dtype_size,
+    greedy_bin_pack,
+    merge_small_dims,
+    multi_dim_split,
+    pack_upper_triangular,
+    ParameterizeEnterExitContext,
+    split_param_groups,
+    unpack_upper_triangular,
+)
+from torch import distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
+from torch.testing._internal.distributed.fake_pg import FakeStore
+
+# Hoisted as an annotated module constant so pyre can infer the type of the
+# argument passed to @unittest.skipUnless (it cannot infer from a bare call).
+_HAS_CUDA: bool = torch.cuda.is_available()
+
+
+@instantiate_parametrized_tests
+class MergeSmallDimsTest(unittest.TestCase):
+    @parametrize("threshold, expected_new_tensor_shape", ((10, (10,)), (1, (2, 5))))
+    def test_merge_all_small_dims(
+        self, threshold: int, expected_new_tensor_shape: tuple[int, ...]
+    ) -> None:
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=(1, 2, 5, 1),
+                threshold=threshold,
+                target_tensor_dimensionality=1,
+            ),
+            expected_new_tensor_shape,
+        )
+
+    def test_merge_small_dims_for_single_dim(self) -> None:
+        expected_new_tensor_shape = (2,)
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=torch.Size([2]),
+                threshold=10,
+                target_tensor_dimensionality=1,
+            ),
+            expected_new_tensor_shape,
+        )
+
+    @parametrize("threshold", (10, 1))
+    def test_merge_small_dims_all_ones(self, threshold: int) -> None:
+        expected_new_tensor_shape = (1,)
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=(1, 1, 1, 1),
+                threshold=threshold,
+                target_tensor_dimensionality=1,
+            ),
+            expected_new_tensor_shape,
+        )
+
+    @parametrize(
+        "tensor_shape", ((0,), (0, 1, 5, 10, 20), (1, 5, 0, 10, 20), (1, 5, 10, 20, 0))
+    )
+    def test_merge_small_dims_empty(self, tensor_shape: tuple[int, ...]) -> None:
+        expected_new_tensor_shape = (0,)
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=tensor_shape, threshold=10, target_tensor_dimensionality=1
+            ),
+            expected_new_tensor_shape,
+        )
+
+    @parametrize("threshold", (10, 1))
+    def test_empty_dims(self, threshold: int) -> None:
+        expected_new_tensor_shape = (1,)
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=(), threshold=threshold, target_tensor_dimensionality=1
+            ),
+            expected_new_tensor_shape,
+        )
+
+    def test_target_tensor_dimensionality_is_inf(self) -> None:
+        expected_new_tensor_shape = (1, 2, 5, 1)
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=(1, 2, 5, 1),
+                threshold=10,
+                target_tensor_dimensionality=math.inf,
+            ),
+            expected_new_tensor_shape,
+        )
+
+    @parametrize(
+        "threshold, target_tensor_dimensionality, expected_new_tensor_shape",
+        [
+            (10, 1, (32, 3, 64, 64)),
+            (200, 1, (32, 192, 64)),
+            (8192, 1, (96, 4096)),
+            (1_000_000, 1, (96 * 4096,)),
+            (10, 2, (32, 3, 64, 64)),
+            (200, 2, (32, 192, 64)),
+            (8192, 2, (96, 4096)),
+            (
+                1_000_000,
+                2,
+                (32, 3 * 4096),
+            ),
+            (8192, 1, (96, 4096)),
+            (8192, 2, (96, 4096)),
+            (8192, 3, (32, 3, 4096)),
+            (8192, 4, (32, 3, 64, 64)),
+            (8192, math.inf, (32, 3, 64, 64)),
+        ],
+    )
+    def test_convolution_like_dims(
+        self,
+        threshold: int,
+        target_tensor_dimensionality: int,
+        expected_new_tensor_shape: tuple[int, ...],
+    ) -> None:
+        self.assertEqual(
+            merge_small_dims(
+                tensor_shape=(32, 3, 64, 64),
+                threshold=threshold,
+                target_tensor_dimensionality=target_tensor_dimensionality,
+            ),
+            expected_new_tensor_shape,
+        )
+
+
+class MultiDimSplitTest(unittest.TestCase):
+    def test_multi_dim_split_for_one_dim(self) -> None:
+        grad = torch.arange(10).reshape(5, 2)
+        expected_split_grad = (
+            torch.arange(6).reshape(3, 2),
+            torch.arange(6, 10).reshape(2, 2),
+        )
+        torch.testing.assert_close(
+            multi_dim_split(grad, split_size=3), expected_split_grad
+        )
+
+    def test_multi_dim_split_for_two_dim(self) -> None:
+        grad = torch.arange(15).reshape(5, 3)
+        expected_split_grad = (
+            torch.tensor([[0, 1], [3, 4]]),
+            torch.tensor([[2], [5]]),
+            torch.tensor([[6, 7], [9, 10]]),
+            torch.tensor([[8], [11]]),
+            torch.tensor([[12, 13]]),
+            torch.tensor([[14]]),
+        )
+        torch.testing.assert_close(
+            multi_dim_split(grad, split_size=2), expected_split_grad
+        )
+
+    def test_multi_dim_split_without_spliting(self) -> None:
+        grad = torch.arange(15).reshape(5, 3)
+        expected_split_grad = (
+            torch.tensor([[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11], [12, 13, 14]]),
+        )
+        torch.testing.assert_close(
+            multi_dim_split(grad, split_size=5), expected_split_grad
+        )
+
+    def test_split_size_is_inf(self) -> None:
+        grad = torch.arange(15).reshape(5, 3)
+        expected_split_grad = (grad,)
+        torch.testing.assert_close(
+            multi_dim_split(grad, split_size=math.inf), expected_split_grad
+        )
+
+
+@instantiate_parametrized_tests
+class CompressListTest(unittest.TestCase):
+    @parametrize(
+        "selector, compressed_tuple",
+        (
+            ((True, True, False), (1, 2)),
+            ((False, True, True), (2, 3)),
+            ((True, False, True), (1, 3)),
+        ),
+    )
+    def test_compress_list(
+        self, selector: tuple[bool, ...], compressed_tuple: tuple[int,]
+    ) -> None:
+        self.assertEqual(
+            compress_list(complete_list=[1, 2, 3], selector=selector), compressed_tuple
+        )
+
+    def test_compress_list_with_different_size(self) -> None:
+        self.assertRaisesRegex(
+            AssertionError,
+            re.escape("Inconsistent lengths"),
+            compress_list,
+            complete_list=[1, 2, 3],
+            selector=(True, False),
+        )
+
+
+@instantiate_parametrized_tests
+class GetDTypeSizeTest(unittest.TestCase):
+    @parametrize(
+        "dtype, size",
+        ((torch.int64, 8), (torch.float32, 4), (torch.bfloat16, 2), (torch.bool, 1)),
+    )
+    def test_get_dtype_size(self, dtype: torch.dtype, size: int) -> None:
+        self.assertEqual(get_dtype_size(dtype), size)
+
+
+class GeneratePairwiseIndicesTest(unittest.TestCase):
+    def test_generate_pairwise_indices(self) -> None:
+        input_tuple = (1, 3, 2)
+        expected_pairwise_indices = [(0, 1), (1, 4), (4, 6)]
+        self.assertListEqual(
+            list(generate_pairwise_indices(input_tuple)), expected_pairwise_indices
+        )
+
+    def test_generate_pairwise_indices_with_empty_list(self) -> None:
+        input_tuple = ()
+        expected_pairwise_indices: list[int] = []
+        self.assertListEqual(
+            list(generate_pairwise_indices(input_tuple)), expected_pairwise_indices
+        )
+
+
+@instantiate_parametrized_tests
+class ComputeChunkSizesTest(unittest.TestCase):
+    """Tests for _compute_chunk_sizes which mirrors torch.chunk semantics."""
+
+    @parametrize(
+        "numel, num_chunks, expected",
+        [
+            # numel == 0: all chunks get size 0
+            (0, 1, [0]),
+            (0, 4, [0, 0, 0, 0]),
+            # numel >= num_chunks, evenly divisible
+            (4, 4, [1, 1, 1, 1]),
+            (8, 4, [2, 2, 2, 2]),
+            (12, 4, [3, 3, 3, 3]),
+            # numel >= num_chunks, not evenly divisible (last chunk gets remainder)
+            (10, 4, [3, 3, 3, 1]),
+            (7, 3, [3, 3, 1]),
+            (5, 2, [3, 2]),
+            (1, 1, [1]),
+            # numel < num_chunks: each element is its own chunk, extras are 0
+            (2, 4, [1, 1, 0, 0]),
+            (1, 4, [1, 0, 0, 0]),
+            (3, 5, [1, 1, 1, 0, 0]),
+        ],
+    )
+    def test_compute_chunk_sizes(
+        self, numel: int, num_chunks: int, expected: list[int]
+    ) -> None:
+        result = _compute_chunk_sizes(numel, num_chunks)
+        self.assertEqual(result, expected)
+
+    @parametrize("numel", (1, 5, 10, 13, 32, 100))
+    @parametrize("num_chunks", (1, 2, 3, 4, 7, 8))
+    def test_matches_torch_chunk(self, numel: int, num_chunks: int) -> None:
+        """Verify _compute_chunk_sizes matches actual torch.chunk behavior."""
+        tensor = torch.arange(numel)
+        actual_chunks = torch.chunk(tensor, num_chunks, dim=0)
+        actual_sizes = [c.numel() for c in actual_chunks]
+
+        computed_sizes = _compute_chunk_sizes(numel, num_chunks)
+        # torch.chunk may produce fewer chunks than num_chunks if numel < num_chunks.
+        # _compute_chunk_sizes pads with zeros in that case.
+        nonzero_computed = [s for s in computed_sizes if s > 0]
+        self.assertEqual(nonzero_computed, actual_sizes)
+        self.assertEqual(sum(computed_sizes), numel)
+
+    def test_sum_equals_numel(self) -> None:
+        """Verify all chunk sizes sum to the original numel."""
+        for numel in range(0, 20):
+            for num_chunks in range(1, 8):
+                sizes = _compute_chunk_sizes(numel, num_chunks)
+                self.assertEqual(
+                    sum(sizes),
+                    numel,
+                    f"Sum mismatch for numel={numel}, num_chunks={num_chunks}",
+                )
+                self.assertEqual(
+                    len(sizes),
+                    num_chunks,
+                    f"Length mismatch for numel={numel}, num_chunks={num_chunks}",
+                )
+
+
+class ParameterizeEnterExitContextTest(unittest.TestCase):
+    """Test suite for the ParameterizeEnterExitContext class.
+
+    This test case verifies the functionality of the ParameterizeEnterExitContext
+    class, ensuring that the enter and exit methods are called correctly on the
+    input object, and that the object's state is modified as expected.
+    """
+
+    def test_parameterize_enter_exit_context(self) -> None:
+        """Test the enter and exit context management.
+
+        This test creates an instance of a TestClass, which has enter and exit
+        methods that modify an internal variable. It then uses the
+        ParameterizeEnterExitContext to ensure that the enter method is called
+        upon entering the context and the exit method is called upon exiting,
+        verifying the changes in the internal state of the TestClass instance.
+        """
+
+        class TestClass:
+            def __init__(self) -> None:
+                self._test_var = 0
+
+            def enter(self) -> None:
+                self._test_var = 1
+
+            def exit(self) -> None:
+                self._test_var = -1
+
+            @property
+            def test_var(self) -> int:
+                return self._test_var
+
+        test_class = TestClass()
+        with ParameterizeEnterExitContext(
+            input_with_enter_exit_context=test_class,
+            enter_method_caller=methodcaller("enter"),
+            exit_method_caller=methodcaller("exit"),
+        ):
+            # Due to the invocation of test_class.enter(), the state of test_class.test_var should be 1.
+            self.assertEqual(test_class.test_var, 1)
+
+        # Due to the invocation of test_class.exit(), the state of test_class.test_var should be -1.
+        self.assertEqual(test_class.test_var, -1)
+
+
+@instantiate_parametrized_tests
+class DistributeBufferSizesTest(unittest.TestCase):
+    @staticmethod
+    def empty_tensor_list(sizes: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            torch.empty(size, device="meta", dtype=torch.bool) for size in sizes
+        )
+
+    @parametrize(
+        "blocked_params, group_size, load_balancing_config, expected_result",
+        (
+            # Test case 1: Even distribution of buffer sizes
+            (
+                empty_tensor_list((128, 64, 500, 256)),
+                2,
+                LoadBalancingConfig(),
+                (
+                    (128, 1),
+                    (64, 1),
+                    (512, 0),
+                    (256, 1),
+                ),
+            ),
+            # Test case 2: Single group
+            (
+                empty_tensor_list((128, 64, 500, 256)),
+                1,
+                LoadBalancingConfig(),
+                (
+                    (128, 0),
+                    (64, 0),
+                    (512, 0),
+                    (256, 0),
+                ),
+            ),
+            # Test case 3: More groups than buffers
+            (
+                empty_tensor_list((128, 64)),
+                4,
+                LoadBalancingConfig(),
+                ((128, 0), (64, 1)),
+            ),
+            # Test case 4: Empty buffer sizes
+            ((), 2, LoadBalancingConfig(), ()),
+            # Test case 5: Linear Compute Cost Model
+            (
+                empty_tensor_list((128, 64, 512, 256)),
+                2,
+                LoadBalancingConfig(
+                    cost_model=PolynomialComputationalCostModel(coefficients=(0, 2))
+                ),
+                (
+                    (128, 1),
+                    (64, 1),
+                    (512, 0),
+                    (256, 1),
+                ),
+            ),
+            # Test case 6: Quadratic Compute Cost Model
+            # Rank 0 gets tensors of sizes 256, 256, and 128, Rank 1 gets a tensor of size 384.
+            # The quadratic computational cost of Rank 0 equals that of Rank 1: 384² = 256² + 256² + 128²
+            (
+                empty_tensor_list((256, 128, 384, 256)),
+                2,
+                LoadBalancingConfig(
+                    cost_model=PolynomialComputationalCostModel(coefficients=(0, 0, 1))
+                ),
+                (
+                    (256, 1),
+                    (128, 1),
+                    (384, 0),
+                    (256, 1),
+                ),
+            ),
+        ),
+    )
+    def test_distribute_buffer_sizes(
+        self,
+        blocked_params: tuple[torch.Tensor, ...],
+        group_size: int,
+        load_balancing_config: LoadBalancingConfig,
+        expected_result: tuple[tuple[int, int], ...],
+    ) -> None:
+        self.assertEqual(
+            distribute_buffer_sizes(
+                blocked_params=blocked_params,
+                group_size=group_size,
+                load_balancing_config=load_balancing_config,
+            ),
+            expected_result,
+        )
+
+
+@instantiate_parametrized_tests
+class PackUpperTriangularTest(unittest.TestCase):
+    def test_pack_2x2(self) -> None:
+        # [[1, 2], [3, 4]] in row-major upper-triangular order: (0,0), (0,1), (1,1).
+        torch.testing.assert_close(
+            pack_upper_triangular(torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
+            torch.tensor([1.0, 2.0, 4.0]),
+        )
+
+    def test_pack_3x3(self) -> None:
+        # Row-major upper-triangular order for 3x3:
+        # (0,0), (0,1), (0,2), (1,1), (1,2), (2,2).
+        torch.testing.assert_close(
+            pack_upper_triangular(
+                torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+            ),
+            torch.tensor([1.0, 2.0, 3.0, 5.0, 6.0, 9.0]),
+        )
+
+    def test_pack_1x1(self) -> None:
+        torch.testing.assert_close(
+            pack_upper_triangular(torch.tensor([[42.0]])),
+            torch.tensor([42.0]),
+        )
+
+    @parametrize("dim", (1, 2, 3, 5, 8))
+    def test_pack_size_invariant(self, dim: int) -> None:
+        packed = pack_upper_triangular(torch.zeros(dim, dim))
+        self.assertEqual(packed.shape, (dim * (dim + 1) // 2,))
+
+    def test_pack_preserves_dtype_and_device(self) -> None:
+        for dtype in (torch.float32, torch.float64, torch.bfloat16):
+            packed = pack_upper_triangular(torch.zeros(3, 3, dtype=dtype))
+            self.assertEqual(packed.dtype, dtype)
+
+
+@instantiate_parametrized_tests
+class UnpackUpperTriangularTest(unittest.TestCase):
+    def test_unpack_2x2(self) -> None:
+        # [1, 2, 4] reconstructs to symmetric matrix [[1, 2], [2, 4]].
+        torch.testing.assert_close(
+            unpack_upper_triangular(torch.tensor([1.0, 2.0, 4.0]), dim=2),
+            torch.tensor([[1.0, 2.0], [2.0, 4.0]]),
+        )
+
+    def test_unpack_3x3(self) -> None:
+        torch.testing.assert_close(
+            unpack_upper_triangular(
+                torch.tensor([1.0, 2.0, 3.0, 5.0, 6.0, 9.0]), dim=3
+            ),
+            torch.tensor([[1.0, 2.0, 3.0], [2.0, 5.0, 6.0], [3.0, 6.0, 9.0]]),
+        )
+
+    def test_unpack_returns_symmetric(self) -> None:
+        unpacked = unpack_upper_triangular(
+            torch.arange(1, 11, dtype=torch.float32), dim=4
+        )
+        torch.testing.assert_close(unpacked, unpacked.T)
+
+    @parametrize("dim", (1, 2, 3, 5, 8))
+    def test_pack_unpack_roundtrip_symmetric(self, dim: int) -> None:
+        # Build a random symmetric matrix and verify pack -> unpack returns it.
+        a = torch.randn(dim, dim)
+        symmetric = a + a.T
+        torch.testing.assert_close(
+            unpack_upper_triangular(pack_upper_triangular(symmetric), dim=dim),
+            symmetric,
+        )
+
+    def test_unpack_preserves_dtype_and_device(self) -> None:
+        for dtype in (torch.float32, torch.float64, torch.bfloat16):
+            unpacked = unpack_upper_triangular(torch.zeros(6, dtype=dtype), dim=3)
+            self.assertEqual(unpacked.dtype, dtype)
+
+    @parametrize("device", ("cpu", "cuda") if _HAS_CUDA else ("cpu",))
+    @parametrize("dtype", (torch.float32, torch.float64, torch.bfloat16))
+    def test_bitwise_equal_to_index_put_reference(
+        self, dtype: torch.dtype, device: str
+    ) -> None:
+        # Reference: fill the upper triangle, then mirror it with a second index_put.
+        # The gather must copy every element bit for bit, including signed zeros,
+        # NaN payloads, and infinities.
+        for dim in (*range(1, 34), 64, 127, 128):
+            a = torch.randn(dim, dim, device=device).to(dtype)
+            symmetric = a + a.T
+            symmetric.view(-1)[:: max(1, dim // 3)] = -0.0
+            if dim > 2:
+                symmetric[0, 1] = symmetric[1, 0] = float("nan")
+                symmetric[1, 2] = symmetric[2, 1] = float("inf")
+            rows, cols = torch.triu_indices(dim, dim, device=device)
+            reference_packed = symmetric[rows, cols]
+            reference_unpacked = torch.zeros(dim, dim, dtype=dtype, device=device)
+            reference_unpacked[rows, cols] = reference_packed
+            reference_unpacked[cols, rows] = reference_packed
+
+            packed = pack_upper_triangular(symmetric)
+            unpacked = unpack_upper_triangular(reference_packed, dim=dim)
+            int_dtype = (
+                torch.int16
+                if dtype == torch.bfloat16
+                else torch.int32
+                if dtype == torch.float32
+                else torch.int64
+            )
+            self.assertTrue(
+                torch.equal(packed.view(int_dtype), reference_packed.view(int_dtype)),
+                msg=f"{dim=}",
+            )
+            self.assertTrue(
+                torch.equal(
+                    unpacked.view(int_dtype), reference_unpacked.view(int_dtype)
+                ),
+                msg=f"{dim=}",
+            )
+            self.assertTrue(packed.is_contiguous() and unpacked.is_contiguous())
+
+            # Non-contiguous inputs: a transposed view and a slice of a larger buffer,
+            # each compared against advanced indexing on the same view.
+            buffer = torch.zeros(dim + 3, dim + 5, dtype=dtype, device=device)
+            buffer[:dim, :dim] = symmetric
+            for view in (symmetric.T, buffer[:dim, :dim]):
+                self.assertTrue(
+                    torch.equal(
+                        pack_upper_triangular(view).view(int_dtype),
+                        view[rows, cols].view(int_dtype),
+                    ),
+                    msg=f"{dim=} {view.stride()=}",
+                )
+
+    def test_rejects_malformed_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "2D square matrix"):
+            pack_upper_triangular(torch.zeros(3, 4))
+        with self.assertRaisesRegex(ValueError, "2D square matrix"):
+            pack_upper_triangular(torch.zeros(6))
+        for bad_packed in (torch.zeros(5), torch.zeros(7), torch.zeros(2, 3)):
+            with self.assertRaisesRegex(ValueError, "1D packed tensor with 6 elements"):
+                unpack_upper_triangular(bad_packed, dim=3)
+
+    def test_pack_unpack_compile_on_cpu(self) -> None:
+        # The cached indices must live on the same device as the CPU inputs ("cpu", not
+        # "cpu:0"), or fake-tensor device propagation for index_select fails under
+        # torch.compile.
+        symmetric = torch.randn(7, 7)
+        symmetric = symmetric + symmetric.T
+        torch._dynamo.reset()
+        try:
+            compiled_pack = torch.compile(
+                pack_upper_triangular, backend="eager", fullgraph=True
+            )
+            compiled_unpack = torch.compile(
+                unpack_upper_triangular, backend="eager", fullgraph=True
+            )
+            packed = compiled_pack(symmetric)
+            self.assertTrue(torch.equal(packed, pack_upper_triangular(symmetric)))
+            self.assertTrue(torch.equal(compiled_unpack(packed, dim=7), symmetric))
+        finally:
+            torch._dynamo.reset()
+
+
+class SymmetricPackIndexCacheTest(unittest.TestCase):
+    # The @cache on the index helpers is process-wide; isolate every test
+    # so assertions on cache_info are independent of test ordering.
+    def setUp(self) -> None:
+        _get_triu_flat_indices.cache_clear()
+        _get_symmetric_gather_indices.cache_clear()
+
+    def tearDown(self) -> None:
+        _get_triu_flat_indices.cache_clear()
+        _get_symmetric_gather_indices.cache_clear()
+
+    def test_cache_reuse(self) -> None:
+        # First call populates each cache; subsequent same-dim calls hit it.
+        symmetric = torch.randn(8, 8)
+        symmetric = symmetric + symmetric.T
+        pack_upper_triangular(symmetric)
+        unpack_upper_triangular(torch.zeros(8 * 9 // 2), dim=8)
+        for cache_fn in (_get_triu_flat_indices, _get_symmetric_gather_indices):
+            self.assertEqual(cache_fn.cache_info().misses, 1)
+            self.assertEqual(cache_fn.cache_info().hits, 0)
+
+        for _ in range(5):
+            pack_upper_triangular(symmetric)
+            unpack_upper_triangular(torch.zeros(8 * 9 // 2), dim=8)
+        for cache_fn in (_get_triu_flat_indices, _get_symmetric_gather_indices):
+            self.assertEqual(cache_fn.cache_info().misses, 1)
+            self.assertEqual(cache_fn.cache_info().hits, 5)
+
+        # A different dim should miss exactly once more.
+        larger = torch.randn(16, 16)
+        larger = larger + larger.T
+        pack_upper_triangular(larger)
+        unpack_upper_triangular(torch.zeros(16 * 17 // 2), dim=16)
+        for cache_fn in (_get_triu_flat_indices, _get_symmetric_gather_indices):
+            self.assertEqual(cache_fn.cache_info().misses, 2)
+
+    def test_dtype_and_shape_and_values(self) -> None:
+        # Lock dtype, shape, AND values against torch.triu_indices.
+        rows, cols = torch.triu_indices(32, 32)
+        flat = _get_triu_flat_indices(32, "cpu", 0)
+        self.assertEqual(flat.dtype, torch.int32)
+        self.assertEqual(flat.shape, (32 * 33 // 2,))
+        torch.testing.assert_close(flat, (rows * 32 + cols).to(torch.int32))
+
+        gather = _get_symmetric_gather_indices(32, "cpu", 0)
+        self.assertEqual(gather.dtype, torch.int32)
+        self.assertEqual(gather.shape, (32 * 32,))
+        positions = torch.empty(32, 32, dtype=torch.int32)
+        packed_positions = torch.arange(rows.numel(), dtype=torch.int32)
+        positions[rows, cols] = packed_positions
+        positions[cols, rows] = packed_positions
+        torch.testing.assert_close(gather, positions.flatten())
+
+    def test_index_dtype_widens_past_int32_range(self) -> None:
+        # Flat offsets reach d * d - 1: int32 holds them up to d = 46340.
+        self.assertEqual(_index_dtype(4096), torch.int32)
+        self.assertEqual(_index_dtype(46340), torch.int32)
+        self.assertEqual(_index_dtype(46341), torch.int64)
+
+    def test_device_key_normalizes_cpu(self) -> None:
+        # cpu always normalizes to ('cpu', 0).
+        self.assertEqual(_device_key(torch.device("cpu")), ("cpu", 0))
+
+    @unittest.skipUnless(_HAS_CUDA, "CUDA required")
+    def test_device_key_normalizes_cuda(self) -> None:
+        # cuda without explicit index must collapse to the current device,
+        # so str-form aliases ('cuda' vs 'cuda:0') don't double-cache.
+        self.assertEqual(
+            _device_key(torch.device("cuda")),
+            _device_key(torch.device("cuda", torch.cuda.current_device())),
+        )
+
+    @unittest.skipUnless(_HAS_CUDA, "CUDA required")
+    def test_cuda_roundtrip(self) -> None:
+        symmetric = torch.randn(16, 16, device="cuda")
+        symmetric = symmetric + symmetric.T
+        packed = pack_upper_triangular(symmetric)
+        self.assertEqual(packed.device.type, "cuda")
+        unpacked = unpack_upper_triangular(packed, dim=16)
+        torch.testing.assert_close(unpacked, symmetric)
+
+
+@instantiate_parametrized_tests
+class SplitParamGroupsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # ROUND_ROBIN now computes a load-balanced global owner map in
+        # split_param_groups; for FSDP configs the shard-dim size is the world
+        # size. These CPU unit tests run without an initialized process group,
+        # so patch get_world_size. (HSDP configs read the size from device_mesh
+        # and are unaffected.) The value only affects owner assignment, not the
+        # bucket sizes these tests assert on.
+        patcher = patch(
+            "distributed_shampoo.utils.shampoo_utils.dist.get_world_size",
+            return_value=2,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _make_group(
+        num_params: int,
+        distributed_config: object,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        params = [torch.zeros(1) for _ in range(num_params)]
+        group: dict[str, object] = {
+            PARAMS: params,
+            DISTRIBUTED_CONFIG: distributed_config,
+        }
+        if extra is not None:
+            group.update(extra)
+        return group
+
+    @staticmethod
+    def _make_fsdp_config(num_sub_groups: int) -> FullyShardDistributedConfig:
+        return FullyShardDistributedConfig(
+            param_assignment_strategy=FSDPParamAssignmentStrategy.ROUND_ROBIN,
+            num_sub_groups=num_sub_groups,
+        )
+
+    def test_passthrough_when_num_sub_groups_is_1(self) -> None:
+        # No sub-group split, but ROUND_ROBIN still gets a load-balanced global
+        # owner map attached under OWNER_RANKS so the single distributor can
+        # consume it. The params are preserved (same list object).
+        config = self._make_fsdp_config(num_sub_groups=1)
+        group = self._make_group(num_params=4, distributed_config=config)
+        result = split_param_groups([group])
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0][PARAMS], group[PARAMS])
+        self.assertIn(OWNER_RANKS, result[0])
+        owner_ranks = result[0][OWNER_RANKS]
+        self.assertEqual(len(owner_ranks), 4)
+        # world size patched to 2 -> every owner is a valid shard rank.
+        self.assertTrue(all(0 <= r < 2 for r in owner_ranks))
+
+    def test_round_robin_owner_map_is_load_balanced(self) -> None:
+        """ROUND_ROBIN's owner map is LPT-balanced by bytes, not positional.
+
+        With large params whose indices collide under ``i % shard``, the
+        positional scheme stacks them on one rank; the load-balanced map spreads
+        them across ranks and lowers the per-owner byte maximum.
+        """
+        shard_size = 4
+        # Two large params at indices that collide mod shard_size (0 and 4), plus
+        # small params. Positional (i % shard) would put both large ones on rank 0.
+        numels = [1000, 10, 10, 10, 1000, 10, 10, 10]
+        params = [torch.zeros(n) for n in numels]
+        config = self._make_fsdp_config(num_sub_groups=1)
+        group: dict[str, object] = {PARAMS: params, DISTRIBUTED_CONFIG: config}
+        with patch(
+            "distributed_shampoo.utils.shampoo_utils.dist.get_world_size",
+            return_value=shard_size,
+        ):
+            owner_ranks = split_param_groups([group])[0][OWNER_RANKS]
+
+        self.assertEqual(len(owner_ranks), len(numels))
+        self.assertTrue(all(0 <= r < shard_size for r in owner_ranks))
+        # The two large params (indices 0 and 4) land on DISTINCT owner ranks.
+        self.assertNotEqual(owner_ranks[0], owner_ranks[4])
+
+        elem = params[0].element_size()
+
+        def per_owner_max(assignment: list[int]) -> float:
+            totals = [0.0] * shard_size
+            for i, r in enumerate(assignment):
+                totals[r] += numels[i] * elem
+            return max(totals)
+
+        positional = [i % shard_size for i in range(len(numels))]
+        # Load-balanced max per-owner bytes is strictly better than positional
+        # here (positional stacks both large params on rank 0).
+        self.assertLess(per_owner_max(owner_ranks), per_owner_max(positional))
+
+    def test_split_per_bucket_owner_coverage_and_balance(self) -> None:
+        """Split-path owner assignment (Option C): per-bucket coverage + balance.
+
+        ``_create_sub_groups`` assigns owners PER BUCKET (LPT across all shard
+        ranks, with per-rank load carried across buckets), so every sub-group must
+        cover ALL shard ranks -- no zero-owner ranks (the residue-class collapse a
+        single sliced global map produced at num_sub_groups>1) -- while the carry
+        keeps the GLOBAL per-owner byte load balanced. ``OWNER_RANKS`` must also
+        stay length-aligned to each sub-group's ``PARAMS`` even though
+        ``greedy_bin_pack`` (LPT) reorders indices within a bucket.
+        """
+        # get_world_size is patched to 2 in setUp -> shard_size 2. numels chosen so
+        # LPT reorders indices within buckets (large params sort first).
+        numels = [1, 100, 1, 100]
+        params = [torch.zeros(n) for n in numels]
+        shard_size = 2
+        config = self._make_fsdp_config(num_sub_groups=2)
+        group: dict[str, object] = {PARAMS: params, DISTRIBUTED_CONFIG: config}
+
+        result = split_param_groups([group])
+        self.assertEqual(len(result), 2)
+
+        load_per_rank = [0] * shard_size
+        for sub in result:
+            self.assertIn(OWNER_RANKS, sub)
+            sub_params = sub[PARAMS]
+            sub_owners = sub[OWNER_RANKS]
+            # Present + length-aligned to this sub-group's params.
+            self.assertEqual(len(sub_owners), len(sub_params))
+            # Coverage: every shard rank owns >= 1 param in THIS sub-group -- the
+            # property the global-slice approach violated by collapsing owners onto
+            # a residue class mod num_sub_groups.
+            self.assertEqual(
+                set(sub_owners),
+                set(range(shard_size)),
+                f"sub-group leaves shard ranks empty: OWNER_RANKS={sub_owners}",
+            )
+            for p, r in zip(sub_params, sub_owners, strict=True):
+                load_per_rank[r] += p.numel()
+        # Global balance: per-rank total load is even (LPT-with-carry across
+        # buckets keeps the whole-model owner load balanced, like a global map).
+        self.assertEqual(
+            max(load_per_rank),
+            min(load_per_rank),
+            f"global per-rank load imbalanced across sub-groups: {load_per_rank}",
+        )
+
+    def test_round_robin_zero_owner_rank_split_is_accepted(self) -> None:
+        """Regression test for the codex finding (split-acceptance half): a shard
+        rank owning zero params is NOT rejected as a deadlock.
+
+        Fewer params (2) than shard ranks (4) -> the global LPT owner map covers
+        only 2 ranks, so >= 2 shard ranks own zero params. FSDP has no per-bucket
+        >= shard_size guard, so split_param_groups must accept it without raising.
+        The REAL send/recv-size behavior for such a zero-owner rank (recv empty,
+        still sends -> participates via all_to_all padding, no hang) is exercised
+        against the real GatherGradientsContext in
+        ``GatherGradientsZeroOwnerRankTest`` below.
+        """
+        shard_size = 4
+        params = [torch.zeros(1000), torch.zeros(500)]
+        config = self._make_fsdp_config(num_sub_groups=1)
+        group: dict[str, object] = {PARAMS: params, DISTRIBUTED_CONFIG: config}
+        with patch(
+            "distributed_shampoo.utils.shampoo_utils.dist.get_world_size",
+            return_value=shard_size,
+        ):
+            # No raise; OWNER_RANKS attached and aligned to params.
+            result = split_param_groups([group])
+
+        self.assertEqual(len(result), 1)
+        owner_ranks = result[0][OWNER_RANKS]
+        self.assertEqual(len(owner_ranks), len(params))
+        self.assertTrue(all(0 <= r < shard_size for r in owner_ranks))
+        # At least one shard rank owns zero params -> the accepted scenario.
+        self.assertTrue([r for r in range(shard_size) if r not in set(owner_ranks)])
+
+    def test_passthrough_for_non_fsdp_config(self) -> None:
+        # SingleDeviceDistributedConfig has no num_sub_groups field; should pass through.
+        group = self._make_group(
+            num_params=4, distributed_config=SingleDeviceDistributedConfig()
+        )
+        result = split_param_groups([group])
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], group)
+
+    @parametrize(
+        "num_params, num_sub_groups, expected_sizes",
+        (
+            (6, 3, [2, 2, 2]),
+            (5, 4, [2, 1, 1, 1]),
+        ),
+    )
+    def test_split_distribution(
+        self, num_params: int, num_sub_groups: int, expected_sizes: list[int]
+    ) -> None:
+        config = self._make_fsdp_config(num_sub_groups=num_sub_groups)
+        group = self._make_group(num_params=num_params, distributed_config=config)
+        result = split_param_groups([group])
+        self.assertEqual(len(result), num_sub_groups)
+        self.assertEqual([len(g[PARAMS]) for g in result], expected_sizes)
+
+    def test_preserves_other_group_keys(self) -> None:
+        config = self._make_fsdp_config(num_sub_groups=2)
+        group = self._make_group(
+            num_params=4, distributed_config=config, extra={"lr": 0.01, "beta3": 0.9}
+        )
+        result = split_param_groups([group])
+        for sub_group in result:
+            self.assertEqual(sub_group["lr"], 0.01)
+            self.assertEqual(sub_group["beta3"], 0.9)
+
+    def test_each_sub_group_gets_distinct_config_copy(self) -> None:
+        config = self._make_fsdp_config(num_sub_groups=2)
+        group = self._make_group(num_params=4, distributed_config=config)
+        result = split_param_groups([group])
+        self.assertIsNot(result[0][DISTRIBUTED_CONFIG], result[1][DISTRIBUTED_CONFIG])
+        self.assertIsNot(result[0][DISTRIBUTED_CONFIG], config)
+
+    def test_raises_when_num_sub_groups_exceeds_num_params(self) -> None:
+        config = self._make_fsdp_config(num_sub_groups=5)
+        group = self._make_group(num_params=3, distributed_config=config)
+        with self.assertRaisesRegex(ValueError, "num_sub_groups=5 is too large"):
+            split_param_groups([group])
+
+    def test_splits_each_input_group_independently(self) -> None:
+        config = self._make_fsdp_config(num_sub_groups=2)
+        group_a = self._make_group(num_params=4, distributed_config=config)
+        group_b = self._make_group(
+            num_params=2, distributed_config=SingleDeviceDistributedConfig()
+        )
+        result = split_param_groups([group_a, group_b])
+        # group_a -> 2 sub-groups; group_b passes through unchanged.
+        self.assertEqual(len(result), 3)
+        self.assertEqual(len(result[0][PARAMS]), 2)
+        self.assertEqual(len(result[1][PARAMS]), 2)
+        self.assertIs(result[2], group_b)
+
+    def test_hsdp_raises_when_dominant_param_starves_a_bin(self) -> None:
+        """HSDP: a single huge param can be alone in a bin, leaving fewer
+        than shard_size params there. Greedy bin-packing must detect and reject."""
+        # 6 params split into 2 bins with shard_size=3. Validation passes
+        # (6 // 3 = 2 >= 2). One param has dominant numel; greedy puts it
+        # alone in a bin → 1 < shard_size, violation.
+        params = [torch.zeros(1000)] + [torch.zeros(1) for _ in range(5)]
+        # Avoid real device mesh init (needs distributed setup).
+        mock_mesh = MagicMock()
+        mock_mesh.size.return_value = 3
+        config = HybridShardDistributedConfig(
+            device_mesh=mock_mesh,
+            param_assignment_strategy=FSDPParamAssignmentStrategy.ROUND_ROBIN,
+            num_sub_groups=2,
+        )
+        group: dict[str, object] = {PARAMS: params, DISTRIBUTED_CONFIG: config}
+        with self.assertRaisesRegex(ValueError, "fewer than shard_size=3"):
+            split_param_groups([group])
+
+
+class GatherGradientsZeroOwnerRankTest(unittest.TestCase):
+    """Regression test for the codex finding: a shard rank owning zero params is
+    NOT a deadlock. Drives the REAL ``GatherGradientsContext`` size computation
+    (the routing line ``owner_ranks[i] == peer_rank``) via a single-process fake
+    process group, so a revert to positional ``i % group_size`` routing would fail
+    this test -- rather than re-deriving the sizes in the test.
+    """
+
+    world_size: int = 4
+    # Owned by no param under the balanced map below -> the zero-owner rank.
+    zero_owner_rank: int = 3
+
+    def setUp(self) -> None:
+        super().setUp()
+        store = FakeStore()
+        dist.init_process_group(
+            backend="fake",
+            rank=self.zero_owner_rank,
+            world_size=self.world_size,
+            store=store,
+        )
+
+    def tearDown(self) -> None:
+        dist.destroy_process_group()
+        super().tearDown()
+
+    def _shard(self, mesh: DeviceMesh, global_numel: int) -> DTensor:
+        # Even dim-0 shard (global_numel divisible by world_size); from_local is
+        # collective-free (only metadata), so it is safe under the fake backend.
+        local = torch.zeros(global_numel // self.world_size)
+        return DTensor.from_local(local, device_mesh=mesh, placements=[Shard(0)])
+
+    def test_zero_owner_rank_sends_but_receives_nothing(self) -> None:
+        mesh = init_device_mesh("cpu", (self.world_size,))
+        # param0 (smaller) and param1 (larger): the balanced LPT map assigns the
+        # LARGER param to rank 0 and the smaller to rank 1 -> owner map [1, 0],
+        # which DIFFERS from positional i % world (== [0, 1]). Ranks 2 and 3 own
+        # nothing under either scheme.
+        params = (self._shard(mesh, 500), self._shard(mesh, 1000))
+        owner_ranks = [
+            r
+            for _, r in distribute_buffer_sizes(
+                params, self.world_size, LoadBalancingConfig()
+            )
+        ]
+        # Balanced map differs from positional and leaves rank 3 zero-owner.
+        self.assertEqual(owner_ranks, [1, 0])
+        self.assertNotIn(self.zero_owner_rank, set(owner_ranks))
+        assigned_params_mask = tuple(o == self.zero_owner_rank for o in owner_ranks)
+        self.assertFalse(any(assigned_params_mask))
+
+        ctx = GatherGradientsContext(
+            params=params,
+            assigned_params_mask=assigned_params_mask,
+            dist_group=mesh.get_group(),
+            owner_ranks=owner_ranks,
+        )
+        # Drive the REAL size-computation method (routes via owner_ranks).
+        send_sizes, recv_sizes = ctx._compute_send_recv_sizes()
+
+        # Zero-owner rank receives nothing (owns no params) ...
+        self.assertEqual(sum(recv_sizes), 0)
+        # ... but still SENDS its local shard of every param to that param's owner,
+        # so it participates in the all_to_all (padded) -> no hang/deadlock.
+        self.assertGreater(sum(send_sizes), 0)
+
+        # And the send sizes reflect the BALANCED owner map, not positional. Rank 3
+        # ships its shard of each param to that param's owner:
+        #   balanced owners [1, 0]:  peer0 gets param1's shard (1000/4=250),
+        #                            peer1 gets param0's shard (500/4=125).
+        # A positional revert (owners [0, 1]) would instead yield [125, 250, 0, 0].
+        self.assertEqual(send_sizes, [250, 125, 0, 0])
+
+
+class GreedyBinPackTest(unittest.TestCase):
+    def test_skewed_sizes(self) -> None:
+        """Largest item should be alone; three small items in the other bin."""
+        items = [1000, 100, 100, 100]
+        bins, costs = greedy_bin_pack(items, num_bins=2, cost_fn=lambda x: x)
+        # Bin 0 gets the largest item first, bin 1 gets the rest.
+        self.assertEqual(sorted(costs), [300, 1000])
+        self.assertEqual(sum(len(b) for b in bins), 4)
+
+    def test_more_bins_than_items(self) -> None:
+        """Empty bins should be present when num_bins > len(items)."""
+        items = ["a", "b"]
+        bins, costs = greedy_bin_pack(items, num_bins=4, cost_fn=lambda x: 1)
+        non_empty = [b for b in bins if b]
+        self.assertEqual(len(non_empty), 2)
+        self.assertEqual(len(bins), 4)
+
+    def test_single_bin(self) -> None:
+        """All items should end up in one bin."""
+        items = [10, 20, 30]
+        bins, costs = greedy_bin_pack(items, num_bins=1, cost_fn=lambda x: x)
+        self.assertEqual(len(bins), 1)
+        self.assertEqual(costs, [60])
+        self.assertEqual(sorted(bins[0]), [10, 20, 30])
+
+    def test_equal_sizes(self) -> None:
+        """Equal-cost items should be distributed round-robin across bins."""
+        items = list(range(6))
+        bins, costs = greedy_bin_pack(items, num_bins=3, cost_fn=lambda x: 1)
+        # Each bin should get exactly 2 items.
+        for b in bins:
+            self.assertEqual(len(b), 2)
+        self.assertEqual(costs, [2, 2, 2])
+
+    def test_empty_items(self) -> None:
+        """No items should produce all empty bins."""
+        empty_items: list[int] = []
+        bins, costs = greedy_bin_pack(empty_items, num_bins=3, cost_fn=lambda x: x)
+        self.assertEqual(bins, [[], [], []])
+        self.assertEqual(costs, [0, 0, 0])

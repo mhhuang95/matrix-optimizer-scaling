@@ -1,0 +1,16 @@
+# LOCAL packaging for the vendored copy (upstream's pyproject pins torch>=2.8;
+# the _compat_torch22 shim makes torch 2.2.2 work — see VENDORED.txt).
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-shampoo"
+version = "1.0.0+vendored.2837ffc"
+description = "Meta's Distributed Shampoo, vendored with torch 2.2 compat shims"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.2.2"]
+
+[tool.setuptools.packages.find]
+include = ["distributed_shampoo*"]
+exclude = ["distributed_shampoo.gpu_tests*", "distributed_shampoo.examples*"]

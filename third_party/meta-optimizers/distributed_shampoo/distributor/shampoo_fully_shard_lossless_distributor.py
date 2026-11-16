@@ -1,0 +1,323 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+All rights reserved.
+
+This source code is licensed under the BSD-style license found in the
+LICENSE file in the root directory of this source tree.
+
+"""
+
+import logging
+from collections.abc import Iterable
+from typing import Any, Literal, overload
+
+import torch
+from distributed_shampoo.distributor.shampoo_block_info import BlockInfo
+from distributed_shampoo.distributor.shampoo_dist_utils import shampoo_comm_profiler
+from distributed_shampoo.distributor.shampoo_distributor import Distributor
+from distributed_shampoo.shampoo_types import (
+    DISTRIBUTED_CONFIG,
+    FSDPParamAssignmentStrategy,
+    FullyShardDistributedConfig,
+    OWNER_RANKS,
+    PARAMS,
+    ShampooRuntimeConfig,
+)
+from distributed_shampoo.utils.shampoo_fully_shard_utils import (
+    GatherGradientsContext,
+    RedistributeParamsContext,
+)
+from torch import distributed as dist, Tensor
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+class FullyShardLosslessDistributor(Distributor):
+    """FullyShard Lossless Distributor class.
+
+    On top of FullyShardDistributor, this distributor handles the parameter assignment to exchange the gradients
+    and parameter updates across the shards to achieve lossless numerical results compared to default Shampoo.
+
+    Args:
+        param_group (dict[str, Any]): Parameter group containing parameters.
+
+    """
+
+    def __init__(
+        self,
+        param_group: dict[str, Any],
+        runtime_config: ShampooRuntimeConfig | None = None,
+    ) -> None:
+        distributed_config: FullyShardDistributedConfig = param_group[
+            DISTRIBUTED_CONFIG
+        ]
+        self._param_assignment_strategy: FSDPParamAssignmentStrategy = (
+            distributed_config.param_assignment_strategy
+        )
+        logger.info(
+            f"Shampoo FullyShardLosslessDistributor {self._param_assignment_strategy=}",
+        )
+
+        self._group_size: int = dist.get_world_size()
+        self._dist_group: dist.ProcessGroup = dist.new_subgroups(
+            group_size=self._group_size
+        )[0]
+        self._group_rank: int = dist.get_rank(group=self._dist_group)
+
+        # Per-param owner-rank map -- the single source of truth for the assignment
+        # mask AND for every send/recv site in the all_to_all contexts.
+        #   ROUND_ROBIN: load-balanced global map computed once over ALL params in
+        #                split_param_groups() (greedy LPT on per-param cost, aligned
+        #                bytes by default via load_balancing_config) and attached
+        #                under OWNER_RANKS. This replaces the old positional
+        #                ``i % group_size`` assignment, which is just this LPT with a
+        #                uniform cost model; there is no separate strategy.
+        #   REPLICATE:   unused (all ranks own everything); left as None.
+        num_params = len(param_group[PARAMS])
+        if self._param_assignment_strategy == FSDPParamAssignmentStrategy.ROUND_ROBIN:
+            owner_ranks = param_group.get(OWNER_RANKS)
+            assert owner_ranks is not None and len(owner_ranks) == num_params, (
+                "ROUND_ROBIN requires a precomputed OWNER_RANKS map aligned to "
+                "params (set by split_param_groups); "
+                f"got {None if owner_ranks is None else len(owner_ranks)} for "
+                f"{num_params} params."
+            )
+            self._owner_ranks: list[int] | None = list(owner_ranks)
+        else:  # REPLICATE
+            self._owner_ranks = None
+
+        def should_assign_param_idx(i: int) -> bool:
+            return (
+                self._owner_ranks[i] == self._group_rank
+                if self._owner_ranks is not None
+                else True
+            )
+
+        self._assigned_params_mask: tuple[bool, ...] = tuple(
+            should_assign_param_idx(idx) for idx in range(num_params)
+        )
+
+        # For ROUND_ROBIN, create the optimized redistribution context that
+        # precomputes all static information for efficient all_to_all.
+        self._redistribute_ctx: RedistributeParamsContext | None = (
+            RedistributeParamsContext(
+                params=param_group[PARAMS],
+                assigned_params_mask=self._assigned_params_mask,
+                dist_group=self._dist_group,
+                owner_ranks=self._owner_ranks,
+            )
+            if self._owner_ranks is not None
+            else None
+        )
+
+        # For ROUND_ROBIN, create the gradient gathering context that uses
+        # all_to_all instead of per-param full_tensor() all-gathers.
+        self._gather_grads_ctx: GatherGradientsContext | None = (
+            GatherGradientsContext(
+                params=param_group[PARAMS],
+                assigned_params_mask=self._assigned_params_mask,
+                dist_group=self._dist_group,
+                owner_ranks=self._owner_ranks,
+            )
+            if self._owner_ranks is not None
+            else None
+        )
+
+        # Set _param_group early so _get_assigned_full_params can access it
+        # (super().__init__ will set it again to the same value).
+        self._param_group = param_group
+        # Rebuild from the live model at the first step: callers may load model
+        # weights after construction without loading optimizer state (e.g. a
+        # MaaS warm start), and update_params would write this snapshot back.
+        self._needs_full_param_refresh: bool = True
+        self._assigned_full_params: list[Tensor] = self._get_assigned_full_params()
+
+        super().__init__(param_group, runtime_config)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            # logging local blocked info list for easier debugging
+            local_block_id_list = tuple(
+                block_info.composable_block_ids
+                for block_info in self._local_block_info_list
+            )
+            logger.debug(
+                f"Local blocked params[size={len(local_block_id_list)}]: {local_block_id_list}"
+            )
+
+    @torch.no_grad()
+    def _get_assigned_full_params(self) -> list[Tensor]:
+        """Gather full parameter tensors for params assigned to this rank.
+
+        For ROUND_ROBIN, uses all_to_all to gather only assigned params efficiently.
+        For REPLICATE, falls back to per-param full_tensor() all-gathers.
+
+        Returns:
+            List of full parameter tensors assigned to this rank.
+        """
+        if self._gather_grads_ctx is not None:
+            all_params = self._gather_grads_ctx.gather_params()
+            return [p for p in all_params if p is not None]
+        else:
+            full_params = [p.full_tensor() for p in self._param_group[PARAMS]]
+            return [
+                p
+                for p, assigned in zip(full_params, self._assigned_params_mask)
+                if assigned
+            ]
+
+    @overload
+    @torch.no_grad()
+    def _get_params_or_grads(
+        self, get_grad: Literal[True]
+    ) -> Iterable[Tensor | None]: ...
+
+    @overload
+    @torch.no_grad()
+    def _get_params_or_grads(
+        self, get_grad: Literal[False] = False
+    ) -> Iterable[Tensor]: ...
+
+    @torch.no_grad()
+    def _get_params_or_grads(self, get_grad: bool = False) -> Iterable[Tensor | None]:
+        """Helper function to get the assigned full params (or gradients) from the param_group.
+
+        Args:
+            get_grad (bool): Whether to return the param or the grad of the param.
+        Returns:
+            local (Iterable[Tensor | None]): assigned full params (or grad) from the param_group.
+        """
+
+        if get_grad:
+            gather_grads_ctx = self._gather_grads_ctx
+            if gather_grads_ctx is not None:
+                # ROUND_ROBIN: use all_to_all to gather grads efficiently.
+                # Each rank only receives full grads for its assigned params.
+                with shampoo_comm_profiler(
+                    f"{self.__class__.__name__}::gather_gradients_all_to_all"
+                ):
+                    full_grads = gather_grads_ctx.gather_gradients()
+            else:
+                # REPLICATE: fall back to per-param full_tensor() all-gathers.
+                with shampoo_comm_profiler(
+                    f"{self.__class__.__name__}::grad_full_tensors"
+                ):
+                    full_grads = [
+                        None if p.grad is None else p.grad.full_tensor()
+                        for p in self._param_group[PARAMS]
+                    ]
+            return (
+                full_grad
+                for full_grad, assigned in zip(
+                    full_grads, self._assigned_params_mask, strict=True
+                )
+                if assigned and (full_grad is None or full_grad.numel() > 0)
+            )
+
+        else:
+            return filter(
+                lambda p: isinstance(p, Tensor) and p.numel() > 0,
+                self._assigned_full_params,
+            )
+
+    @torch.no_grad()
+    def update_params(
+        self,
+        blocked_search_directions: tuple[Tensor, ...],
+        use_masked_tensors: bool = True,
+    ) -> None:
+        """Update params stored inside this distributor according to the input search directions argument.
+
+        Args:
+            blocked_search_directions (tuple[Tensor, ...]): Search directions for each local blocked parameter.
+                This tuple might be empty if the parameters are not receiving gradients.
+            use_masked_tensors (bool): If True (default), operates on masked blocked params.
+                If False, operates on all local blocked params regardless of gradient masking.
+
+        """
+        super().update_params(blocked_search_directions, use_masked_tensors)
+
+        # Copy the updated full parameters to the original parameters in the param group.
+        # For example, when the strategy is REPLICATE, we need to take each updated full parameter `full_param`,
+        # redistribute it according to the device mesh to get the locally assigned slice, and copy the slice to the
+        # corresponding local parameter `local_param` in the param group.
+        if self._redistribute_ctx is not None:
+            with shampoo_comm_profiler(
+                f"{self.__class__.__name__}::_redistribute_ctx.redistribute_and_update_params"
+            ):
+                self._redistribute_ctx.redistribute_and_update_params(
+                    self._assigned_full_params,
+                )
+
+        elif self._param_assignment_strategy == FSDPParamAssignmentStrategy.REPLICATE:
+            local_params = list(
+                filter(lambda p: p.numel() > 0, self._param_group[PARAMS])
+            )
+            full_param_slices = [
+                # When param assignment strategy is REPLICATE, explicitly set `src_data_rank` to None to avoid
+                # triggering communication and simply use the local copy of replicated parameters.
+                dist.tensor.distribute_tensor(
+                    full_param,
+                    local_param.device_mesh,
+                    local_param.placements,
+                    src_data_rank=None,
+                ).to_local()
+                for local_param, full_param in zip(
+                    local_params,
+                    self._get_params_or_grads(),
+                    strict=True,
+                )
+            ]
+            # torch._foreach_copy_ requires both lists of tensors to be local tensors.
+            torch._foreach_copy_(
+                [p.to_local() for p in local_params], full_param_slices
+            )
+
+    @torch.no_grad()
+    def _construct_local_block_info_list(self) -> tuple[BlockInfo, ...]:
+        """Construct local block info list from param_group."""
+        return self._construct_local_block_info_list_with_params(
+            params=(
+                p
+                for assigned, p in zip(
+                    self._assigned_params_mask, self._param_group[PARAMS], strict=True
+                )
+                if assigned and p.numel() > 0
+            ),
+            rank=None,
+        )
+
+    @property
+    def needs_full_param_refresh(self) -> bool:
+        return self._needs_full_param_refresh
+
+    def mark_full_params_stale(self) -> None:
+        """Defer rebuilding gathered parameters until their next use."""
+        self._needs_full_param_refresh = True
+
+    @torch.no_grad()
+    def refresh_assigned_full_params(self) -> None:
+        """Refresh the cached full parameter tensors from current model parameters.
+
+        This method should be called after loading a checkpoint to ensure the
+        distributor's cached tensors reflect the updated model parameter values.
+        Without calling this, the optimizer may use stale parameter values.
+
+        This method refreshes:
+        1. _assigned_full_params - the cached full tensor copies
+        2. _global_blocked_params and _local_blocked_params - views of the full tensors
+        """
+        self._assigned_full_params = self._get_assigned_full_params()
+        # Also re-block the parameters since _global_blocked_params are views of the old
+        # _assigned_full_params tensors
+        self._merge_and_block_parameters()
+        # Update _local_blocked_params and _local_masked_blocked_params which are set
+        # in parent's __init__ but don't get updated by _merge_and_block_parameters()
+        self._local_blocked_params = self._global_blocked_params
+        self._local_masked_blocked_params = self._local_blocked_params
+        # Force merge_and_block_gradients() to rebuild _local_masked_blocked_params on
+        # the next step: its resync is gated on the grad selector changing, which does
+        # not happen when the same param is grad-less before and after a checkpoint
+        # resume, leaving _local_masked_blocked_params at the full (unmasked) length and
+        # mismatching the masked blocked_search_directions in update_params.
+        self._previous_global_grad_selector = None
+        self._needs_full_param_refresh = False

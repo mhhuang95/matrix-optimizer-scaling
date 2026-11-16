@@ -6,3 +6,4 @@ wandb/
 checkpoints/
 data/
 *.pt
+*.egg-info/

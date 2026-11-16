@@ -10,10 +10,16 @@ dependencies = [
     # Lambda (Linux + CUDA): PyPI wheels ship with CUDA.
     "torch>=2.6; sys_platform == 'linux'",
     "numpy; sys_platform == 'linux'",
+    # Meta's Distributed Shampoo (current main), vendored in third_party with
+    # torch 2.2 compat shims — see third_party/meta-optimizers/VENDORED.txt.
+    "torch-shampoo",
 ]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.uv.sources]
+torch-shampoo = { path = "third_party/meta-optimizers", editable = true }
 
 [tool.uv]
 # Use uv-managed CPython, never a stray system/beta interpreter.

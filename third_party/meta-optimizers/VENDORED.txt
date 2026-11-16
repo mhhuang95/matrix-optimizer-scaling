@@ -1,0 +1,2 @@
+vendored from facebookresearch/optimizers @ 2837ffc80e1b50f325821b53bd6d8ac8247dbae1 (2026-10-23)
+local changes: pyproject.toml (ours), distributed_shampoo/_compat_torch22.py (new), one import line at the top of distributed_shampoo/__init__.py
