@@ -102,8 +102,8 @@ class OptimizerConfig:
         * 0 < shampoo_graft_beta2 < 1
         * shampoo_graft_epsilon > 0
         """
-        if self.arm not in ["muon", "adamw"]:
-            raise ValueError(f"Arm {self.arm} must be in [muon, adamw]!")
+        if self.arm not in ["muon", "adamw", "shampoo"]:
+            raise ValueError(f"Arm {self.arm} must be in [muon, adamw, shampoo]!")
         if not 0 <= self.adamw_betas[0] < 1 or not 0 <= self.adamw_betas[1] < 1:
             raise ValueError(f"both adamw_betas {self.adamw_betas} are in [0, 1)!")
         if not self.adamw_eps > 0:
@@ -112,8 +112,21 @@ class OptimizerConfig:
             raise ValueError(f"muon momentum {self.muon_momentum} must be within [0, 1)!")
         if not self.muon_ns_steps >= 1:
             raise ValueError(f"muon ne steps {self.muon_ns_steps} must be >= 1!")
+        if not 0 <= self.shampoo_betas[0] < 1 or not 0 < self.shampoo_betas[1] <= 1:
+            raise ValueError(f"shampoo beta1 {self.shampoo_betas[0]} should be in range [0, 1), shampoo beta2 {self.shampoo_betas[1]} should be in range (0, 1].")
+        if not self.shampoo_epsilon > 0:
+            raise ValueError(f"shampoo epsilon {self.shampoo_epsilon} should be larger than 0!")
+        if not self.shampoo_max_preconditioner_dim >= 1:
+            raise ValueError(f"shampoo max preconditioner dim {self.shampoo_max_preconditioner_dim} should be larger than or equal to 1!")
+        if not self.shampoo_precondition_frequency >= 1:
+            raise ValueError(f"shampoo precondition frequency {self.shampoo_precondition_frequency} must be >= 1!")
+        if not (self.shampoo_start_preconditioning_step  == -1 or self.shampoo_start_preconditioning_step >= 1):
+            raise ValueError(f"shampoo start preconditioning step {self.shampoo_start_preconditioning_step} must be -1 or >= 1.")
+        if not 0 < self.shampoo_graft_beta2 < 1:
+            raise ValueError(f"shampoo grafting beta2 {self.shampoo_graft_beta2} must be in the range (0, 1).")
+        if not self.shampoo_graft_epsilon > 0:
+            raise ValueError(f"shampoo graft epsilon {self.shampoo_graft_epsilon} must be positive.")
         
-
 
 def build_optimizers(
     model: nn.Module,
