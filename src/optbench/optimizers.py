@@ -112,6 +112,7 @@ class OptimizerConfig:
             raise ValueError(f"muon momentum {self.muon_momentum} must be within [0, 1)!")
         if not self.muon_ns_steps >= 1:
             raise ValueError(f"muon ne steps {self.muon_ns_steps} must be >= 1!")
+        
 
 
 def build_optimizers(
@@ -162,5 +163,14 @@ def build_optimizers(
         if adamw_groups:
             group_opt = torch.optim.AdamW(params=adamw_groups, betas=opt_cfg.adamw_betas, eps=opt_cfg.adamw_eps)
             opt_list.append(group_opt)
+    elif opt_cfg.arm == "shampoo":
+        matrix_groups, adamw_groups = split_by_optimizer(groups)
+        if matrix_groups:
+            group_opt = DistributedShampoo(params=matrix_groups, betas=opt_cfg.shampoo_betas, epsilon=opt_cfg.shampoo_epsilon, max_preconditioner_dim=opt_cfg.shampoo_max_preconditioner_dim, precondition_frequency=opt_cfg.shampoo_precondition_frequency, start_preconditioning_step=opt_cfg.shampoo_start_preconditioning_step, grafting_config=AdamPreconditionerConfig(beta2=opt_cfg.shampoo_graft_beta2, epsilon=opt_cfg.shampoo_graft_epsilon))
+            opt_list.append(group_opt)
+        if adamw_groups:
+            group_opt = torch.optim.AdamW(params=adamw_groups, betas=opt_cfg.adamw_betas, eps=opt_cfg.adamw_eps)
+            opt_list.append(group_opt)
+        
     
     return opt_list
