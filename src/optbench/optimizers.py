@@ -45,10 +45,12 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
+from distributed_shampoo import AdamPreconditionerConfig, DistributedShampoo
+
 from optbench.muon import Muon
 from optbench.param_groups import GroupConfig, build_param_groups, split_by_optimizer
 
-Arm = Literal["muon", "adamw"]
+Arm = Literal["muon", "adamw", "shampoo"]
 
 
 @dataclass
@@ -67,14 +69,38 @@ class OptimizerConfig:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_ns_steps: int = 5
+    # Shampoo (TASK 3d) — plumbed into the vendored DistributedShampoo.
+    # betas[1] may be exactly 1.0: that is AdaGrad-style accumulation of the
+    # factor matrices (Meta's own default) rather than an EMA.
+    shampoo_betas: tuple[float, float] = (0.9, 0.999)
+    shampoo_epsilon: float = 1e-12
+    shampoo_max_preconditioner_dim: int = 1024
+    shampoo_precondition_frequency: int = 10
+    # -1 = Meta's default: start at precondition_frequency.
+    shampoo_start_preconditioning_step: int = -1
+    # Grafting: direction from Shampoo, per-layer magnitude from Adam —
+    # keeps Shampoo's lr on Adam's scale, same fairness story as everywhere.
+    shampoo_graft_beta2: float = 0.999
+    shampoo_graft_epsilon: float = 1e-8
 
     def validate(self) -> None:
         """Raise ValueError unless all of these hold:
-        * arm is "muon" or "adamw"
+        * arm is "muon", "adamw" or "shampoo"
         * both adamw_betas are in [0, 1)
         * adamw_eps > 0
         * 0 <= muon_momentum < 1
         * muon_ns_steps >= 1
+        * shampoo_betas: 0 <= betas[0] < 1 and 0 < betas[1] <= 1
+          (note the asymmetry — beta2 == 1.0 is legal, see the field comment)
+        * shampoo_epsilon > 0
+        * shampoo_max_preconditioner_dim >= 1
+        * shampoo_precondition_frequency >= 1
+        * shampoo_start_preconditioning_step is -1 or >= 1
+          (DistributedShampoo itself additionally enforces
+          start >= precondition_frequency at construction — we do not
+          duplicate a check the constructor already owns)
+        * 0 < shampoo_graft_beta2 < 1
+        * shampoo_graft_epsilon > 0
         """
         if self.arm not in ["muon", "adamw"]:
             raise ValueError(f"Arm {self.arm} must be in [muon, adamw]!")
@@ -105,6 +131,16 @@ def build_optimizers(
          (momentum/nesterov/ns_steps from opt_cfg; lr and weight_decay ride
          on the groups) and AdamW over the rest. Skip a side whose group
          list is empty. Return [muon, adamw] in that order.
+      5. arm "shampoo" (TASK 3d): same shape as the muon arm —
+         split_by_optimizer, DistributedShampoo over the matrix groups,
+         AdamW over the rest, skip empty sides, [shampoo, adamw] order.
+         DistributedShampoo kwargs, all from opt_cfg: betas, epsilon,
+         max_preconditioner_dim, precondition_frequency,
+         start_preconditioning_step, and grafting_config =
+         AdamPreconditionerConfig(beta2=shampoo_graft_beta2,
+         epsilon=shampoo_graft_epsilon). As with the other arms, lr and
+         weight_decay ride on the groups (its decoupled weight decay is the
+         default), so pass neither.
 
     Note what this function does NOT take: a learning rate. LRs enter through
     GroupConfig and leave through the schedule; a bare lr argument here would

@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from distributed_shampoo import AdamPreconditionerConfig, DistributedShampoo
+
 from optbench.checkpoint import optimizer_group_names
 from optbench.model import ModelConfig, Transformer
 from optbench.muon import Muon
@@ -46,7 +48,35 @@ class TestOptimizerConfig:
 
     def test_rejects_unknown_arm(self):
         with pytest.raises(ValueError):
-            OptimizerConfig(arm="shampoo").validate()  # not wired up yet
+            OptimizerConfig(arm="sgd").validate()
+
+    def test_shampoo_defaults_are_valid(self):
+        OptimizerConfig(arm="shampoo").validate()
+
+    def test_shampoo_beta2_of_exactly_one_is_valid(self):
+        # AdaGrad-style accumulation — Meta's own default.
+        OptimizerConfig(shampoo_betas=(0.9, 1.0)).validate()
+
+    def test_start_preconditioning_minus_one_is_valid(self):
+        OptimizerConfig(shampoo_start_preconditioning_step=-1).validate()
+
+    def test_rejects_bad_shampoo_fields(self):
+        bad = [
+            dict(shampoo_betas=(-0.1, 0.999)),
+            dict(shampoo_betas=(1.0, 0.999)),
+            dict(shampoo_betas=(0.9, 0.0)),
+            dict(shampoo_betas=(0.9, 1.1)),
+            dict(shampoo_epsilon=0.0),
+            dict(shampoo_max_preconditioner_dim=0),
+            dict(shampoo_precondition_frequency=0),
+            dict(shampoo_start_preconditioning_step=0),
+            dict(shampoo_graft_beta2=0.0),
+            dict(shampoo_graft_beta2=1.0),
+            dict(shampoo_graft_epsilon=0.0),
+        ]
+        for kw in bad:
+            with pytest.raises(ValueError):
+                OptimizerConfig(**kw).validate()
 
     def test_rejects_bad_betas(self):
         with pytest.raises(ValueError):
@@ -147,6 +177,78 @@ class TestMuonArm:
 
 
 # ---------------------------------------------------------------------------
+# the shampoo arm
+# ---------------------------------------------------------------------------
+
+
+class TestShampooArm:
+    def test_returns_shampoo_then_adamw(self):
+        model = tiny_model()
+        opts = build_optimizers(model, *tiny_configs(arm="shampoo"))
+        assert len(opts) == 2
+        assert isinstance(opts[0], DistributedShampoo)
+        assert isinstance(opts[1], torch.optim.AdamW)
+
+    def test_shampoo_gets_exactly_the_matrix_group(self):
+        model = tiny_model()
+        shampoo, adamw = build_optimizers(model, *tiny_configs(arm="shampoo"))
+        assert [g["kind"] for g in shampoo.param_groups] == ["matrix"]
+        for p in shampoo.param_groups[0]["params"]:
+            assert p.ndim == 2
+        assert [g["kind"] for g in adamw.param_groups] == ["embed", "scalar"]
+
+    def test_every_trainable_param_is_covered_exactly_once(self):
+        model = tiny_model()
+        opts = build_optimizers(model, *tiny_configs(arm="shampoo"))
+        seen = [id(p) for opt in opts for g in opt.param_groups for p in g["params"]]
+        expected = {id(p) for p in model.parameters() if p.requires_grad}
+        assert len(seen) == len(set(seen))
+        assert set(seen) == expected
+
+    def test_lr_and_weight_decay_ride_on_the_groups(self):
+        model = tiny_model()
+        gcfg = GroupConfig(matrix_lr=0.015, weight_decay=0.1)
+        shampoo, _ = build_optimizers(model, gcfg, OptimizerConfig(arm="shampoo"))
+        g = shampoo.param_groups[0]
+        assert g["lr"] == 0.015
+        assert g["weight_decay"] == 0.1
+
+    def test_shampoo_hparams_are_plumbed(self):
+        model = tiny_model()
+        ocfg = OptimizerConfig(
+            arm="shampoo",
+            shampoo_betas=(0.85, 0.99),
+            shampoo_epsilon=1e-10,
+            shampoo_max_preconditioner_dim=512,
+            shampoo_precondition_frequency=7,
+            # Meta enforces start >= frequency at construction.
+            shampoo_start_preconditioning_step=14,
+            shampoo_graft_beta2=0.98,
+            shampoo_graft_epsilon=1e-9,
+        )
+        shampoo, _ = build_optimizers(model, GroupConfig(), ocfg)
+        g = shampoo.param_groups[0]
+        assert g["betas"] == (0.85, 0.99)
+        assert g["epsilon"] == 1e-10
+        assert g["max_preconditioner_dim"] == 512
+        assert g["precondition_frequency"] == 7
+        assert g["start_preconditioning_step"] == 14
+        graft = g["grafting_config"]
+        assert isinstance(graft, AdamPreconditionerConfig)
+        assert graft.beta2 == 0.98
+        assert graft.epsilon == 1e-9
+
+    def test_checkpoint_fingerprint_works(self):
+        model = tiny_model()
+        opts = build_optimizers(model, *tiny_configs(arm="shampoo"))
+        names = optimizer_group_names(opts)
+        assert len(names) == 2
+        flat = [n for per_opt in names for group in per_opt for n in group]
+        assert "blocks.0.attn.wq.weight" in flat
+        assert "tok_emb.weight" in flat
+
+
+# ---------------------------------------------------------------------------
 # the adamw arm
 # ---------------------------------------------------------------------------
 
@@ -174,7 +276,7 @@ class TestAdamWArm:
 
 
 class TestIntegration:
-    @pytest.mark.parametrize("arm", ["muon", "adamw"])
+    @pytest.mark.parametrize("arm", ["muon", "adamw", "shampoo"])
     def test_one_schedule_drives_all_optimizers(self, arm):
         model = tiny_model()
         opts = build_optimizers(model, *tiny_configs(arm=arm))
@@ -184,7 +286,7 @@ class TestIntegration:
             for g in opt.param_groups:
                 assert g["lr"] == pytest.approx(0.25 * g["base_lr"])
 
-    @pytest.mark.parametrize("arm", ["muon", "adamw"])
+    @pytest.mark.parametrize("arm", ["muon", "adamw", "shampoo"])
     def test_few_steps_reduce_loss(self, arm):
         torch.manual_seed(SEED)
         model = tiny_model()
