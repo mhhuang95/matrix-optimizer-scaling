@@ -127,4 +127,16 @@ def collect_spectral_stats(
          come from the groups — the same names the checkpoint fingerprint
          uses, so a W&B panel and a checkpoint row agree forever.
     """
-    raise NotImplementedError
+    if source not in ["grad", "param"]:
+        raise ValueError(f"source {source} must be in [grad, param].")
+    spectral_stats_dict = {}
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            if group["kind"] == "matrix":
+                for name, param in zip(group["names"], group["params"]):
+                    tensor = param.grad if source == "grad" else param
+                    if tensor is None:
+                        continue
+                    spectral_stats_dict[name] = spectral_stats(tensor)
+    return spectral_stats_dict
+    
