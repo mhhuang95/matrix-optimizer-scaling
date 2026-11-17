@@ -83,7 +83,27 @@ def spectral_stats(mat: torch.Tensor) -> dict[str, float]:
       6. Every value is a Python float (never a 0-d tensor — these go
          straight into logging dicts and JSON).
     """
-    raise NotImplementedError
+    if not mat.ndim == 2:
+        raise ValueError(f"tensor ndim {mat.ndim} must be 2.")
+    s = torch.linalg.svdvals(mat.detach().float())
+    frobenius_norm = torch.sqrt(torch.sum(s**2))
+    spectral_norm = s.max()
+    nuclear_norm = torch.sum(s)
+    if spectral_norm == 0:
+        return {key: 0.0 for key in STAT_KEYS}
+    stable_rank = (frobenius_norm / spectral_norm)**2
+    p = s / nuclear_norm
+    p = p[p > 0]
+    effective_rank = torch.exp(- torch.sum(p * torch.log(p)))
+    nuclear_frobenius_ratio = nuclear_norm / frobenius_norm
+    return {
+        "frobenius_norm": float(frobenius_norm),
+        "spectral_norm": float(spectral_norm),
+        "nuclear_norm": float(nuclear_norm),
+        "stable_rank": float(stable_rank),
+        "effective_rank": float(effective_rank),
+        "nuclear_frobenius_ratio": float(nuclear_frobenius_ratio),
+    }
 
 
 def collect_spectral_stats(
