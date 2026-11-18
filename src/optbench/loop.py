@@ -94,7 +94,9 @@ def is_due(step: int, every: int) -> bool:
     with the `step_{n}.pt` naming (n completed updates). every == 0 means
     "never" — False for all steps, and NOT a ZeroDivisionError.
     """
-    raise NotImplementedError
+    if every == 0:
+        return False
+    return (step + 1) % every == 0
 
 
 def run_loop(
