@@ -78,7 +78,12 @@ class LoopConfig:
         * checkpoint_every >= 0, log_every >= 0, spectral_every >= 0
         * meter_warmup >= 0
         """
-        raise NotImplementedError
+        if not self.global_batch >= 1:
+            raise ValueError(f"global batch {self.global_batch} must be >= 1!")
+        if not self.checkpoint_every >= 0 or not self.log_every >= 0 or not self.spectral_every >= 0:
+            raise ValueError(f"checkpoint_every {self.checkpoint_every}, log_every {self.log_every}, spectral_every {self.spectral_every} all must be nonnegative!")
+        if not self.meter_warmup >= 0:
+            raise ValueError(f"meter_warmup {self.meter_warmup} must be nonnegative!")
 
 
 def is_due(step: int, every: int) -> bool:
