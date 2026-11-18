@@ -157,4 +157,72 @@ def run_loop(
     already does — a second copy here would drift, the same argument that
     kept `lr` out of build_optimizers).
     """
-    raise NotImplementedError
+    loop_cfg.validate()
+    sched_cfg.validate()
+    step_cfg.validate()
+    if stop_after is not None and stop_after < 1:
+        raise ValueError(f"stop_after {stop_after} must be larger or equal to 1!")
+    
+    start_step = 0
+    path = latest_checkpoint(loop_cfg.checkpoint_dir)
+    if path is not None:
+        restored = load_checkpoint(path, model=model, optimizers=optimizers, scaler=scaler)
+        start_step = restored["step"]
+        extra = restored["extra"]
+        if extra["seed"] != loop_cfg.seed or extra["global_batch"] != loop_cfg.global_batch:
+            raise ValueError(f"the checkpoint seed {extra["seed"]} or global_batch {extra["global_batch"]} doesn't match with loop config!")
+    end_step = sched_cfg.total_steps if stop_after is None else min(sched_cfg.total_steps, start_step + stop_after)
+   
+    model.train()
+    meter = ThroughputMeter(warmup_steps=loop_cfg.meter_warmup)
+    last_saved = start_step
+    extra = {"seed": loop_cfg.seed, "global_batch": loop_cfg.global_batch}
+
+    for step in range(start_step, end_step):
+        mult = lr_multiplier(step, sched_cfg)
+        for optimizer in optimizers:
+            apply_lr(optimizer, mult)
+        micro_batches = [get_batch(windows, step, loop_cfg.global_batch, loop_cfg.seed, micro_step=m, accum_steps=step_cfg.accum_steps, device=loop_cfg.device) for m in range(step_cfg.accum_steps)]
+        
+        if scaler is not None:
+            scale_before = scaler.get_scale()
+        stats = train_step(model, micro_batches, optimizers, step_cfg, scaler)
+        if scaler is not None:
+            skipped = step_was_skipped(scale_before, scaler.get_scale())
+        else:
+            skipped = False
+        meter.update(stats.n_tokens, skipped=skipped)
+
+        log_due = is_due(step, loop_cfg.log_every)
+        spectral_due = is_due(step, loop_cfg.spectral_every)
+        if log_fn is not None and (log_due or spectral_due):
+            row = {
+                "step": step,
+                "loss": stats.loss,
+                "grad_norm": stats.grad_norm,
+                "lr_mult": mult,
+                "tokens_per_sec": meter.tokens_per_sec,
+                "skipped": skipped,
+            }
+            if spectral_due:
+                row["spectral"] = collect_spectral_stats(optimizers, source="grad")
+            log_fn(row)
+        
+        if is_due(step, loop_cfg.checkpoint_every):
+            save_checkpoint(Path(loop_cfg.checkpoint_dir) / f"step_{step+1}.pt", step=step+1, model=model, optimizers=optimizers, scaler=scaler, extra=extra)
+            last_saved = step + 1
+
+    if end_step > start_step and last_saved != end_step:
+        save_checkpoint(Path(loop_cfg.checkpoint_dir) / f"step_{step+1}.pt", step=step+1, model=model, optimizers=optimizers, scaler=scaler, extra=extra)
+    
+    return {
+        "final_step": end_step,
+        "resumed_from": start_step,
+        "steps_run": end_step - start_step
+    }
+
+        
+
+
+
+
