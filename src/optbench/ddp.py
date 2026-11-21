@@ -165,7 +165,12 @@ def wrap_ddp(model: nn.Module, ctx: DistContext) -> nn.Module:
     constructor broadcasts rank 0's parameters to every rank, so even
     differently-initialized replicas start in lockstep.
     """
-    raise NotImplementedError
+    if not ctx.is_distributed:
+        return model
+    if torch.cuda.is_available():
+        return DDP(model, device_ids=[ctx.local_rank])
+    else:
+        return DDP(model)
 
 
 def unwrap_ddp(model: nn.Module) -> nn.Module:
