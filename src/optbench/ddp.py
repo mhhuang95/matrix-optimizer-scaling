@@ -148,7 +148,10 @@ def cleanup_distributed() -> None:
     (Safe-when-absent matters: the single-process path never created one,
     and crash-path cleanup code should not itself crash.)
     """
-    raise NotImplementedError
+    if not dist.is_available():
+        return
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def wrap_ddp(model: nn.Module, ctx: DistContext) -> nn.Module:
