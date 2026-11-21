@@ -179,7 +179,7 @@ def unwrap_ddp(model: nn.Module) -> nn.Module:
     Checkpoints must always save the unwrapped model — DDP.state_dict()
     prefixes keys with "module.", unreadable by a single-process resume.
     """
-    raise NotImplementedError
+    return model.module if isinstance(model, DDP) else model
 
 
 def maybe_no_sync(model: nn.Module, is_last: bool) -> ContextManager[Any]:
