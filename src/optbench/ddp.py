@@ -129,7 +129,17 @@ def init_distributed(
       its default env:// rendezvous (MASTER_ADDR/PORT — exactly what
       torchrun provides); tests pass file:// URLs instead.
     """
-    raise NotImplementedError
+    ctx.validate()
+    if backend is None:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if not ctx.is_distributed:
+        return
+    dist.init_process_group(
+        backend=backend,
+        init_method=init_method,
+        world_size=ctx.world_size,
+        rank=ctx.rank,
+    )
 
 
 def cleanup_distributed() -> None:
