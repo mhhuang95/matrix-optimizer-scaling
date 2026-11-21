@@ -99,7 +99,16 @@ def detect_dist(env: Mapping[str, str] | None = None) -> DistContext:
       half-configured environment means a broken launcher, and guessing
       either value trains a silently wrong job.
     """
-    raise NotImplementedError
+    if env is None:
+        env = os.environ
+    if "RANK" not in env and "WORLD_SIZE" not in env:
+        ctx = DistContext()
+    elif "RANK" in env and "WORLD_SIZE" in env:
+        ctx = DistContext(rank=int(env["RANK"]), world_size=int(env["WORLD_SIZE"]), local_rank=int(env.get("LOCAL_RANK", 0)))
+    else:
+        raise ValueError("Exactly ONE of RANK / WORLD_SIZE exists.")
+    ctx.validate()
+    return ctx
 
 
 def init_distributed(
