@@ -70,12 +70,12 @@ class DistContext:
     @property
     def is_main(self) -> bool:
         """True exactly on rank 0 — the only rank that logs/saves."""
-        raise NotImplementedError
+        return self.rank == 0
 
     @property
     def is_distributed(self) -> bool:
         """True when there is more than one process."""
-        raise NotImplementedError
+        return self.world_size > 1
 
     def validate(self) -> None:
         """Raise ValueError unless all of these hold:
@@ -83,7 +83,8 @@ class DistContext:
         * 0 <= rank < world_size
         * local_rank >= 0
         """
-        raise NotImplementedError
+        if not self.world_size >= 1 or not 0 <= self.rank < self.world_size or not self.local_rank >= 0:
+            raise ValueError(f"world_size {self.world_size} must be >= 1, rank {self.rank} must be in [0, world_size), local_rank {self.local_rank} must be >= 0.") 
 
 
 def detect_dist(env: Mapping[str, str] | None = None) -> DistContext:
