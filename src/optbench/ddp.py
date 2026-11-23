@@ -217,4 +217,12 @@ def all_reduce_mean(value: float) -> float:
 
     For logging only — never on the training path (it is a sync point).
     """
-    raise NotImplementedError
+    if not (dist.is_available() and dist.is_initialized()):
+        return float(value)
+    world = dist.get_world_size()
+    if world == 1:
+        return float(value)
+    t = torch.tensor(float(value), dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float(t / world)
+    
