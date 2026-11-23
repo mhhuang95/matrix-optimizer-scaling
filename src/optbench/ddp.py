@@ -202,7 +202,9 @@ def maybe_no_sync(model: nn.Module, is_last: bool) -> ContextManager[Any]:
     first awareness of DDP, and exactly this much.) The TestNoSyncWiring
     tests fail until the edit lands.
     """
-    raise NotImplementedError
+    if isinstance(model, DDP) and not is_last:
+        return model.no_sync()
+    return nullcontext()
 
 
 def all_reduce_mean(value: float) -> float:
