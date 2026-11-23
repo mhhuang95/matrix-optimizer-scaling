@@ -51,6 +51,7 @@ from optbench.schedule import ScheduleConfig, apply_lr, lr_multiplier
 from optbench.spectral import collect_spectral_stats
 from optbench.throughput import ThroughputMeter, step_was_skipped
 from optbench.train_step import TrainStepConfig, train_step
+from optbench.ddp import DistContext, all_reduce_mean, barrier, unwrap_ddp
 
 
 @dataclass
@@ -110,6 +111,7 @@ def run_loop(
     scaler: Any | None = None,
     stop_after: int | None = None,
     log_fn: Callable[[dict[str, Any]], None] | None = None,
+    dist_ctx: DistContext | None = None, 
 ) -> dict[str, int]:
     """Train from the latest checkpoint (or scratch) toward total_steps.
 
@@ -200,13 +202,16 @@ def run_loop(
     loop_cfg.validate()
     sched_cfg.validate()
     step_cfg.validate()
+    ctx = dist_ctx if dist_ctx is not None else DistContext()
+    ctx.validate()
     if stop_after is not None and stop_after < 1:
         raise ValueError(f"stop_after {stop_after} must be larger or equal to 1!")
     
+    raw = unwrap_ddp(model)
     start_step = 0
     path = latest_checkpoint(loop_cfg.checkpoint_dir)
     if path is not None:
-        restored = load_checkpoint(path, model=model, optimizers=optimizers, scaler=scaler)
+        restored = load_checkpoint(path, model=raw, optimizers=optimizers, scaler=scaler)
         start_step = restored["step"]
         extra = restored["extra"]
         if extra["seed"] != loop_cfg.seed or extra["global_batch"] != loop_cfg.global_batch:
@@ -222,7 +227,7 @@ def run_loop(
         mult = lr_multiplier(step, sched_cfg)
         for optimizer in optimizers:
             apply_lr(optimizer, mult)
-        micro_batches = [get_batch(windows, step, loop_cfg.global_batch, loop_cfg.seed, micro_step=m, accum_steps=step_cfg.accum_steps, device=loop_cfg.device) for m in range(step_cfg.accum_steps)]
+        micro_batches = [get_batch(windows, step, loop_cfg.global_batch, loop_cfg.seed, micro_step=m, accum_steps=step_cfg.accum_steps, device=loop_cfg.device, rank=ctx.rank, world_size=ctx.world_size) for m in range(step_cfg.accum_steps)]
         
         if scaler is not None:
             scale_before = scaler.get_scale()
@@ -231,30 +236,33 @@ def run_loop(
             skipped = step_was_skipped(scale_before, scaler.get_scale())
         else:
             skipped = False
-        meter.update(stats.n_tokens, skipped=skipped)
+        meter.update(stats.n_tokens * ctx.world_size, skipped=skipped)
 
         log_due = is_due(step, loop_cfg.log_every)
         spectral_due = is_due(step, loop_cfg.spectral_every)
-        if log_fn is not None and (log_due or spectral_due):
-            row = {
-                "step": step,
-                "loss": stats.loss,
-                "grad_norm": stats.grad_norm,
-                "lr_mult": mult,
-                "tokens_per_sec": meter.tokens_per_sec,
-                "skipped": skipped,
-            }
-            if spectral_due:
-                row["spectral"] = collect_spectral_stats(optimizers, source="grad")
-            log_fn(row)
+        if log_due or spectral_due:
+            global_loss = all_reduce_mean(stats.loss)
+            if log_fn is not None and ctx.is_main:
+                  row = {
+                     "step": step,
+                     "loss": global_loss,
+                     "grad_norm": stats.grad_norm,
+                     "lr_mult": mult,
+                     "tokens_per_sec": meter.tokens_per_sec,
+                     "skipped": skipped,
+                  }
+                  if spectral_due:
+                     row["spectral"] = collect_spectral_stats(optimizers, source="grad")
+                  log_fn(row)
         
-        if is_due(step, loop_cfg.checkpoint_every):
-            save_checkpoint(Path(loop_cfg.checkpoint_dir) / f"step_{step+1}.pt", step=step+1, model=model, optimizers=optimizers, scaler=scaler, extra=extra)
+        if ctx.is_main and is_due(step, loop_cfg.checkpoint_every):
+            save_checkpoint(Path(loop_cfg.checkpoint_dir) / f"step_{step+1}.pt", step=step+1, model=raw, optimizers=optimizers, scaler=scaler, extra=extra)
             last_saved = step + 1
 
-    if end_step > start_step and last_saved != end_step:
-        save_checkpoint(Path(loop_cfg.checkpoint_dir) / f"step_{step+1}.pt", step=step+1, model=model, optimizers=optimizers, scaler=scaler, extra=extra)
+    if ctx.is_main and end_step > start_step and last_saved != end_step:
+        save_checkpoint(Path(loop_cfg.checkpoint_dir) / f"step_{step+1}.pt", step=step+1, model=raw, optimizers=optimizers, scaler=scaler, extra=extra)
     
+    barrier(ctx)
     return {
         "final_step": end_step,
         "resumed_from": start_step,
