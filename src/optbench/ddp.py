@@ -226,3 +226,24 @@ def all_reduce_mean(value: float) -> float:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return float(t / world)
     
+
+
+def barrier(ctx: DistContext) -> None:
+    """Block until every rank arrives; a no-op when not distributed.
+
+    * ctx not distributed: return immediately.
+    * Distributed but no process group initialized: also a no-op (same
+      defensive guard as all_reduce_mean — cleanup paths must not crash).
+    * Otherwise: dist.barrier().
+
+    run_loop calls this before returning so that "the loop returned" means
+    "rank 0's final checkpoint is durably on disk" ON EVERY RANK — without
+    it, a non-main rank can start the next run_loop call, find no (or a
+    stale) checkpoint, and resume from the wrong step while rank 0 resumes
+    from the right one: a silent fork of the job.
+    """
+    if not ctx.is_distributed:
+        return
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    dist.barrier()

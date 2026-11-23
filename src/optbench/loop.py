@@ -152,6 +152,46 @@ def run_loop(
                  "resumed_from": start_step,
                  "steps_run": end_step - start_step clamped to >= 0}.
 
+      7. TASK 7 — distributed data parallelism. Add a keyword-only parameter
+         `dist_ctx: DistContext | None = None` (import DistContext,
+         all_reduce_mean, barrier, unwrap_ddp from optbench.ddp) and make
+         the loop rank-aware. `None` means DistContext() — single-process
+         behavior must be bit-identical to before. Deltas:
+
+         * ctx = the given DistContext (or the default); ctx.validate()
+           with the other configs. The caller passes the DDP-WRAPPED model
+           as `model` (train_step needs the wrapper for grad sync); compute
+           `raw = unwrap_ddp(model)` once and use `raw` for BOTH
+           load_checkpoint and save_checkpoint — checkpoints never contain
+           "module." prefixes, so a 2-rank run's checkpoint resumes on one
+           process and vice versa.
+         * get_batch gains rank=ctx.rank, world_size=ctx.world_size — the
+           rank-major shard of the SAME global batch; nothing else about
+           data order changes.
+         * meter.update counts JOB tokens: stats.n_tokens * ctx.world_size.
+           Ranks run in lockstep (the all-reduce is a barrier), so the job
+           processes world_size times the local tokens in the same wall
+           clock.
+         * Logging: log_due / spectral_due are pure functions of step, so
+           every rank computes the same answer. When either is due, EVERY
+           rank calls all_reduce_mean(stats.loss) — a collective must be
+           reached by all ranks or the job deadlocks, so never gate it on
+           rank-local state like `log_fn is not None`. Then only
+           ctx.is_main (and log_fn given) builds and emits the row, with
+           row["loss"] = that global mean (identity when single-process).
+           grad_norm needs no reduce: gradients were synced before
+           clipping, so every rank already computed the same norm.
+         * Checkpoints: only ctx.is_main saves (cadence AND final) — one
+           writer per shared directory. Resume loading stays UNGATED:
+           every rank calls latest_checkpoint + load_checkpoint (each
+           replica needs the state), and the seed/global_batch loudness
+           check runs everywhere.
+         * Before returning, call barrier(ctx) — "run_loop returned" must
+           mean "the final checkpoint is durably on disk" on EVERY rank,
+           or a back-to-back resume (and the cluster's next job) races
+           rank 0's file write. barrier is a new 4-line helper in ddp.py
+           (stub at the bottom of that file).
+
     What this function does NOT do: move the model (the caller placed it);
     build optimizers (the factory's job); own total_steps (the schedule
     already does — a second copy here would drift, the same argument that
