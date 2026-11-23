@@ -40,6 +40,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ContextManager, Iterable, Sequence
+from optbench.ddp import maybe_no_sync
 
 import torch
 import torch.nn as nn
@@ -185,18 +186,19 @@ def train_step(
         optimizer.zero_grad(set_to_none=True)
     
     total_loss = None
-    for x, y in micro_batches:
-        with cfg.autocast():
-            logits, loss = model(x, y)
-        loss = loss / cfg.accum_steps
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        if total_loss is None:
-            total_loss = loss.detach()
-        else:
-            total_loss = total_loss + loss.detach()
+    for i, (x, y) in enumerate(micro_batches):
+        with maybe_no_sync(model, is_last=(i == len(micro_batches) - 1)):
+            with cfg.autocast():
+                logits, loss = model(x, y)
+            loss = loss / cfg.accum_steps
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            if total_loss is None:
+                total_loss = loss.detach()
+            else:
+                total_loss = total_loss + loss.detach()
     
     if scaler is not None:
         for optimizer in optimizers:
