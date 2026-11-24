@@ -73,11 +73,24 @@ class LoopConfig:
     spectral_every: int = 0  # 0 = never collect spectral stats
     meter_warmup: int = 0  # ThroughputMeter warmup_steps
 
+    # TASK 8 — MFU in the log row. Both fields or neither (half-configured
+    # is a lie waiting to be logged — same rule as detect_dist's env check).
+    # The CALLER precomputes flops_per_token via throughput.flops_per_token
+    # (the loop owns no model knowledge — the same argument that keeps
+    # total_steps out of LoopConfig); peak_flops_per_gpu comes from the
+    # hardware spec sheet for the dtype actually used (bf16 peak, not fp8
+    # marketing numbers).
+    flops_per_token: int | None = None
+    peak_flops_per_gpu: float | None = None
+
     def validate(self) -> None:
         """Raise ValueError unless all of these hold:
         * global_batch >= 1
         * checkpoint_every >= 0, log_every >= 0, spectral_every >= 0
         * meter_warmup >= 0
+        * flops_per_token and peak_flops_per_gpu are set TOGETHER: exactly
+          one of them being None is a ValueError. When set:
+          flops_per_token >= 1 and peak_flops_per_gpu > 0.
         """
         if not self.global_batch >= 1:
             raise ValueError(f"global batch {self.global_batch} must be >= 1!")
@@ -193,6 +206,32 @@ def run_loop(
            or a back-to-back resume (and the cluster's next job) races
            rank 0's file write. barrier is a new 4-line helper in ddp.py
            (stub at the bottom of that file).
+
+      8. TASK 8 — MFU in the log row. When loop_cfg.flops_per_token is set
+         (validate already guarantees peak_flops_per_gpu comes with it),
+         every emitted row gains one more key:
+
+           row["mfu"] = mfu(row["tokens_per_sec"], loop_cfg.flops_per_token,
+                            n_gpus=ctx.world_size,
+                            peak_flops_per_gpu=loop_cfg.peak_flops_per_gpu)
+
+         (import mfu from optbench.throughput), EXCEPT when
+         row["tokens_per_sec"] is None (meter still in warmup, or a
+         zero-width clock window) — then row["mfu"] = None too. None, never
+         0.0: zero is a measurement ("the GPUs did nothing"), None is "no
+         measurement yet", and a fake zero averaged into a W&B panel
+         understates every mean it touches — the same no-fake-values
+         discipline as the spectral module's no-NaN rule.
+
+         Why n_gpus = ctx.world_size: the meter already counts JOB tokens
+         (local * world_size), so the denominator must be the JOB's peak
+         FLOPs. Mismatching the two (job tokens over one GPU's peak) is the
+         classic way to report MFU > 1 under DDP — which mfu() deliberately
+         does not clamp, so the bug surfaces in the logs instead of hiding.
+
+         When flops_per_token is None, the row has NO "mfu" key at all —
+         absent, not None: "not configured" and "configured but not yet
+         measurable" must look different to a log reader.
 
     What this function does NOT do: move the model (the caller placed it);
     build optimizers (the factory's job); own total_steps (the schedule
