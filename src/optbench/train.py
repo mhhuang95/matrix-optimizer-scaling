@@ -118,7 +118,38 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
     world_size == 1 anywhere — the ctx defaults make one process just the
     degenerate case of N.
     """
-    raise NotImplementedError
+    args = parse_args(argv)
+    cfg = load_config(args.config)
+    ctx = detect_dist()
+    try:
+        init_distributed(ctx)
+        if torch.cuda.is_available():
+            device = f"cuda:{ctx.local_rank}"
+            torch.cuda.set_device(device)
+            device_type = "cuda"
+        else:
+            device = "cpu"
+            device_type = "cpu"
+        loop_cfg = replace(cfg.loop, device=device)
+        step_cfg = replace(cfg.step, device_type=device_type)
+        torch.manual_seed(cfg.loop.seed)
+        model = Transformer(cfg.model).to(device)
+        optimizers = build_optimizers(model, cfg.groups, cfg.opt)
+        wrapped = wrap_ddp(model, ctx)
+        shards = sorted(Path(cfg.data_dir).glob("shard_*.bin"))
+        if not shards:
+            raise ValueError(f"{cfg.data_dir} -- empty shards!")
+        windows = TokenWindows(shards, cfg.seq_len)
+        if loop_cfg.peak_flops_per_gpu is not None and loop_cfg.flops_per_token is None:
+            loop_cfg = replace(loop_cfg, flops_per_token=flops_per_token(cfg.model, cfg.seq_len))
+        log_fn = None
+        if ctx.is_main and args.log_file != "none":
+            path = args.log_file if args.log_file is not None else Path(loop_cfg.checkpoint_dir) / "log.jsonl"
+            log_fn = jsonl_logger(path)
+        out = run_loop(wrapped, windows, optimizers, loop_cfg, cfg.sched, step_cfg, log_fn=log_fn, dist_ctx=ctx)
+        return out
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
