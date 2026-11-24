@@ -49,7 +49,7 @@ from optbench.checkpoint import latest_checkpoint, load_checkpoint, save_checkpo
 from optbench.data import TokenWindows, get_batch
 from optbench.schedule import ScheduleConfig, apply_lr, lr_multiplier
 from optbench.spectral import collect_spectral_stats
-from optbench.throughput import ThroughputMeter, step_was_skipped
+from optbench.throughput import ThroughputMeter, step_was_skipped, mfu
 from optbench.train_step import TrainStepConfig, train_step
 from optbench.ddp import DistContext, all_reduce_mean, barrier, unwrap_ddp
 
@@ -98,6 +98,11 @@ class LoopConfig:
             raise ValueError(f"checkpoint_every {self.checkpoint_every}, log_every {self.log_every}, spectral_every {self.spectral_every} all must be nonnegative!")
         if not self.meter_warmup >= 0:
             raise ValueError(f"meter_warmup {self.meter_warmup} must be nonnegative!")
+        if (self.flops_per_token is None) != (self.peak_flops_per_gpu is None):
+            raise ValueError(f"flops_per_token {self.flops_per_token} and peak_flops_per_gpu {self.peak_flops_per_gpu} must be set together!")
+        if self.flops_per_token is not None and self.peak_flops_per_gpu is not None:
+            if not (self.flops_per_token >= 1 and self.peak_flops_per_gpu > 0):
+                raise ValueError(f"flops_per_token {self.flops_per_token} must be >= 1 and peak_flops_per_gpu {self.peak_flops_per_gpu} must be > 0.")
 
 
 def is_due(step: int, every: int) -> bool:
@@ -290,6 +295,11 @@ def run_loop(
                      "tokens_per_sec": meter.tokens_per_sec,
                      "skipped": skipped,
                   }
+                  if loop_cfg.flops_per_token is not None:
+                     if row["tokens_per_sec"] is None:
+                         row["mfu"] = None
+                     else:
+                         row["mfu"] = mfu(row["tokens_per_sec"], loop_cfg.flops_per_token, n_gpus=ctx.world_size, peak_flops_per_gpu=loop_cfg.peak_flops_per_gpu)
                   if spectral_due:
                      row["spectral"] = collect_spectral_stats(optimizers, source="grad")
                   log_fn(row)
