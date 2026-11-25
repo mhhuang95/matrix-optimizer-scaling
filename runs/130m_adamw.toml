@@ -1,0 +1,50 @@
+# 130M adamw arm, 1x Chinchilla.
+# Architecture matches Wen et al. "Fantastic Pretraining Optimizers" (ICLR 2026)
+# LLaMA-130M: d=512, d_ff=2048, 32 layers, 8 heads, seq 4096 — so loss curves are
+# sanity-comparable against wandb.ai/marin-community (tokenizer differs: we use
+# GPT-2 BPE, they use Llama's, so compare shapes/speedups, not absolute loss).
+#
+# Launch:  ./scripts/launch.sh runs/130m_adamw.toml --wandb optbench --wandb-run-name 130m-adamw-1x
+
+[run]
+data_dir = "data/fineweb_edu"
+seq_len = 4096
+
+[model]
+vocab_size = 50304     # GPT-2's 50257 padded to a multiple of 128 for matmul shape
+d_model = 512
+n_layers = 32
+n_heads = 8
+n_kv_heads = 8         # MHA at this scale, like Wen et al.
+d_ff = 2048
+max_seq_len = 4096
+
+[loop]
+global_batch = 128     # x 4096 = 524,288 tokens/step; 16 windows per rank on 8 GPUs
+seed = 0
+checkpoint_dir = "out/130m_adamw_1x"
+checkpoint_every = 500
+log_every = 10
+spectral_every = 100   # the study's novelty: per-layer grad spectra over training
+meter_warmup = 10
+peak_flops_per_gpu = 989e12   # H100 SXM dense bf16, no sparsity
+
+[schedule]
+kind = "cosine"
+total_steps = 5000     # ~2.62B tokens = 1x Chinchilla for 130M
+warmup_steps = 500
+min_lr_ratio = 0.1
+
+[train_step]
+accum_steps = 1
+grad_clip = 1.0
+amp_dtype = "bf16"
+
+[groups]
+matrix_lr = 1e-3       # tuned-AdamW sweep center (Wen et al.: tuned AdamW LRs sit well above folk defaults)
+embed_lr = 1e-3
+scalar_lr = 1e-3
+weight_decay = 0.1
+
+[optimizer]
+arm = "adamw"

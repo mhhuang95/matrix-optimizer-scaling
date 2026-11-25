@@ -1,11 +1,8 @@
 """FineWeb-Edu -> shard_*.bin: the one-time pass that feeds every run.
 
-TASK 10 — implement `pack_documents` (the one `raise NotImplementedError`).
-Run `uv run pytest tests/test_tokenize_data.py -v` until all tests pass.
+    python -m optbench.tokenize_data --out data/fineweb_edu --max-tokens 2e9
 
-The glue around it (HF streaming iterator, tiktoken encoding, the CLI) is
-boilerplate — third-party integration, already written below. The core is
-yours because it IS the data contract of the whole study:
+pack_documents is the data contract of the whole study:
 
   * **Packing, not padding.** Documents are concatenated into one endless
     token stream with an EOS token APPENDED after every document; fixed-size
@@ -26,36 +23,9 @@ yours because it IS the data contract of the whole study:
     into one directory would train on silently duplicated data — the same
     "half-configured is a lie" rule as everywhere else.
 
-pack_documents(docs, *, out_dir, vocab_size, eos_id,
-               shard_tokens=1 << 24, max_tokens=None) -> dict
-
-Steps:
-  1. Validate: shard_tokens < 1 is a ValueError; eos_id outside
-     [0, vocab_size) is a ValueError. mkdir out_dir (parents, exist_ok),
-     then raise ValueError naming out_dir if it already contains any
-     shard_*.bin.
-  2. Keep the buffer as a LIST of numpy arrays plus a running token count —
-     never one giant Python list of ints (billions of boxed ints is the
-     classic way this script eats all the RAM). Concatenate only at write
-     time. For each doc: append np.asarray(doc) and a 1-element EOS array;
-     an empty doc still contributes its EOS.
-  3. WHILE the buffered count >= shard_tokens (while, not if — one huge
-     document can fill several shards): concatenate, write exactly the
-     first shard_tokens tokens as shard_{index:05d}.bin via
-     optbench.shards.write_shard (atomic tmp+rename, validates ids against
-     vocab_size), keep the remainder as the new buffer. Indices count up
-     from 0.
-  4. Budget: after each doc lands in the buffer, if max_tokens is not None
-     and the running TOTAL (written + buffered, EOS included) is
-     >= max_tokens, stop pulling docs. The stream is lazy — stopping is
-     what keeps a 2B-token job from downloading all 10B.
-  5. After the doc loop: a total of 0 tokens (empty docs iterable) is a
-     ValueError — a dataset of nothing must die here, not as an empty glob
-     at train time. Otherwise flush whatever is buffered as one final,
-     smaller shard (TokenWindows gives a short shard (n-1)//seq_len
-     windows, so a tiny tail is harmless, never corrupting).
-  6. Return {"docs": ..., "tokens": ..., "shards": ...} — the numbers the
-     run log and the grant arithmetic both want.
+  * **Lazy budget.** max_tokens stops PULLING documents once
+     written + buffered crosses it — the HF stream is lazy, so this is what
+     keeps a 2B-token job from downloading all 10B.
 """
 
 from __future__ import annotations
@@ -86,7 +56,42 @@ def pack_documents(
     max_tokens: int | None = None,
 ) -> dict[str, int]:
     """Pack token-id documents into fixed-size shards. See module docstring."""
-    raise NotImplementedError
+    if shard_tokens < 1:
+        raise ValueError(f"shard_tokens {shard_tokens} must be >= 1!")
+    if not 0 <= eos_id < vocab_size:
+        raise ValueError(f"eos_id {eos_id} must be in the range [0, vocab_size).")
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if any(out.glob("shard_*.bin")):
+        raise ValueError(f"{out} already contains shard_*.bin files; refusing to mix datasets")
+
+    eos = np.array([eos_id], dtype=np.uint32)
+    buf: list[np.ndarray] = []  # list of arrays, concatenated only at write time
+    buffered = total = n_docs = n_shards = 0
+
+    for doc in docs:
+        arr = np.asarray(doc)
+        buf.append(arr)
+        buf.append(eos)
+        buffered += arr.size + 1
+        total += arr.size + 1
+        n_docs += 1
+        while buffered >= shard_tokens:  # while: one huge doc can fill several shards
+            flat = np.concatenate(buf)
+            write_shard(out / f"shard_{n_shards:05d}.bin", flat[:shard_tokens], vocab_size)
+            n_shards += 1
+            rest = flat[shard_tokens:]
+            buf = [rest] if rest.size else []
+            buffered = int(rest.size)
+        if max_tokens is not None and total >= max_tokens:
+            break  # the stream is lazy: stop pulling, don't keep downloading
+
+    if total == 0:
+        raise ValueError("no tokens to pack: the docs iterable was empty")
+    if buffered:
+        write_shard(out / f"shard_{n_shards:05d}.bin", np.concatenate(buf), vocab_size)
+        n_shards += 1
+    return {"docs": n_docs, "tokens": total, "shards": n_shards}
 
 
 # ----------------------------------------------------------------------------

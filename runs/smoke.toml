@@ -1,0 +1,45 @@
+# Smoke test: ~2 minutes on one GPU (or CPU), against the real tokenized data.
+# Run this FIRST on a fresh instance — it exercises config -> data -> model ->
+# optimizer -> loop -> checkpoint -> log end to end before any real money burns.
+#
+#   ./scripts/launch.sh runs/smoke.toml
+
+[run]
+data_dir = "data/fineweb_edu"
+seq_len = 512
+
+[model]
+vocab_size = 50304
+d_model = 128
+n_layers = 4
+n_heads = 4
+n_kv_heads = 4
+d_ff = 512
+max_seq_len = 512
+
+[loop]
+global_batch = 8
+seed = 0
+checkpoint_dir = "out/smoke"
+checkpoint_every = 25
+log_every = 5
+spectral_every = 25
+meter_warmup = 2
+
+[schedule]
+kind = "cosine"
+total_steps = 50
+warmup_steps = 5
+
+[train_step]
+grad_clip = 1.0
+amp_dtype = "bf16"
+
+[groups]
+matrix_lr = 0.02
+embed_lr = 3e-4
+scalar_lr = 3e-4
+weight_decay = 0.1
+
+[optimizer]
+arm = "muon"
