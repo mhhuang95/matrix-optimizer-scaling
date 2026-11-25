@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,6 +36,7 @@ from optbench.loop import run_loop
 from optbench.model import Transformer
 from optbench.optimizers import build_optimizers
 from optbench.throughput import flops_per_token
+from optbench.wandb_log import tee, wandb_logger
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -47,6 +48,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="JSONL metrics path; default <checkpoint_dir>/log.jsonl; "
         "'none' disables logging",
+    )
+    p.add_argument(
+        "--wandb",
+        default=None,
+        metavar="PROJECT",
+        help="also mirror log rows to this W&B project "
+        "(requires `uv sync --extra wandb`); jsonl stays the source of truth",
+    )
+    p.add_argument(
+        "--wandb-run-name",
+        default=None,
+        help="W&B run name; default lets wandb generate one",
     )
     return p.parse_args(argv)
 
@@ -109,7 +122,8 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
          write — emission is is_main-gated inside the loop anyway) and
          args.log_file != "none". Path: args.log_file, defaulting to
          Path(loop_cfg.checkpoint_dir) / "log.jsonl". Build it with
-         jsonl_logger.
+         jsonl_logger. With --wandb PROJECT, a wandb_logger sink is TEED in
+         alongside jsonl (never instead of it), and finished in the finally.
      11. out = run_loop(wrapped, windows, optimizers, loop_cfg, cfg.sched,
          step_cfg, log_fn=log_fn, dist_ctx=ctx); return out.
 
@@ -121,6 +135,7 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
     args = parse_args(argv)
     cfg = load_config(args.config)
     ctx = detect_dist()
+    finish_wandb = None
     try:
         init_distributed(ctx)
         if torch.cuda.is_available():
@@ -143,12 +158,28 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         if loop_cfg.peak_flops_per_gpu is not None and loop_cfg.flops_per_token is None:
             loop_cfg = replace(loop_cfg, flops_per_token=flops_per_token(cfg.model, cfg.seq_len))
         log_fn = None
-        if ctx.is_main and args.log_file != "none":
-            path = args.log_file if args.log_file is not None else Path(loop_cfg.checkpoint_dir) / "log.jsonl"
-            log_fn = jsonl_logger(path)
+        if ctx.is_main:
+            sinks = []
+            if args.log_file != "none":
+                path = args.log_file if args.log_file is not None else Path(loop_cfg.checkpoint_dir) / "log.jsonl"
+                sinks.append(jsonl_logger(path))
+            if args.wandb is not None:
+                wb = wandb_logger(
+                    project=args.wandb,
+                    checkpoint_dir=loop_cfg.checkpoint_dir,
+                    run_name=args.wandb_run_name,
+                    # asdict -> json round-trip: torch dtypes etc. become strings
+                    config=json.loads(json.dumps(asdict(cfg), default=str)),
+                )
+                finish_wandb = wb.finish
+                sinks.append(wb)
+            if sinks:
+                log_fn = tee(*sinks) if len(sinks) > 1 else sinks[0]
         out = run_loop(wrapped, windows, optimizers, loop_cfg, cfg.sched, step_cfg, log_fn=log_fn, dist_ctx=ctx)
         return out
     finally:
+        if finish_wandb is not None:
+            finish_wandb()  # flush the W&B run even when the loop raised
         cleanup_distributed()
 
 

@@ -15,6 +15,11 @@ dependencies = [
     "torch-shampoo",
 ]
 
+[project.optional-dependencies]
+# Live monitoring on Lambda: `uv sync --extra wandb`. Not installed on the
+# Mac dev box — train.py imports wandb lazily, only when --wandb is passed.
+wandb = ["wandb>=0.17"]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 
