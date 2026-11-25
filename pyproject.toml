@@ -19,6 +19,8 @@ dependencies = [
 # Live monitoring on Lambda: `uv sync --extra wandb`. Not installed on the
 # Mac dev box — train.py imports wandb lazily, only when --wandb is passed.
 wandb = ["wandb>=0.17"]
+# One-time tokenization pass (optbench.tokenize_data): `uv sync --extra data`.
+data = ["datasets>=3", "tiktoken>=0.7"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
